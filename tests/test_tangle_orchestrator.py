@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ORCHESTRATOR = PROJECT_ROOT / "scripts" / "tangle_orchestrator.py"
@@ -746,6 +748,13 @@ class ProductLayerTests(RepoCase):
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline and not info.is_file():
                 time.sleep(0.05)
+            if not info.is_file():
+                if process.poll() is None:
+                    self.fail("Dashboard stayed alive but did not write readiness metadata")
+                stderr = process.stderr.read() if process.stderr else ""
+                self.fail(
+                    f"Dashboard exited {process.returncode} before readiness:\n{stderr}"
+                )
             details = json.loads(info.read_text(encoding="utf-8"))
             url = details["url"]
             self.assertTrue(url.startswith("http://127.0.0.1:"), url)
@@ -799,6 +808,27 @@ class ProductLayerTests(RepoCase):
                 process.stdout.close()
             if process.stderr:
                 process.stderr.close()
+
+    def test_dashboard_binding_does_not_depend_on_reverse_dns(self) -> None:
+        specification = importlib.util.spec_from_file_location(
+            "tangle_dashboard_test_module", DASHBOARD
+        )
+        self.assertIsNotNone(specification)
+        self.assertIsNotNone(specification.loader if specification else None)
+        module = importlib.util.module_from_spec(specification)
+        assert specification and specification.loader
+        specification.loader.exec_module(module)
+        with mock.patch(
+            "socket.getfqdn", side_effect=AssertionError("reverse DNS is forbidden")
+        ):
+            server = module.TangleHttpServer(
+                ("127.0.0.1", 0), self.root, ORCHESTRATOR
+            )
+        try:
+            self.assertEqual("127.0.0.1", server.server_name)
+            self.assertGreater(server.server_port, 0)
+        finally:
+            server.server_close()
 
     def test_mcp_bundle_is_complete_and_reproducible(self) -> None:
         with tempfile.TemporaryDirectory(prefix="tangle-mcpb-") as temporary:

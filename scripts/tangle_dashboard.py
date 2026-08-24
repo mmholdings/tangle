@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 from typing import Any
 
 VERSION = "0.3.0"
@@ -208,6 +209,15 @@ refresh(true); setInterval(()=>refresh(false),3000);
 
 class TangleHttpServer(ThreadingHTTPServer):
     daemon_threads = True
+
+    def server_bind(self) -> None:
+        # HTTPServer's default binding performs a reverse-DNS lookup for its
+        # display name. That can stall for several seconds on otherwise valid
+        # loopback-only macOS hosts, delaying the readiness file. Tangle never
+        # needs an external hostname, so retain the numeric address.
+        TCPServer.server_bind(self)
+        self.server_name = str(self.server_address[0])
+        self.server_port = int(self.server_address[1])
 
     def __init__(self, address: tuple[str, int], repo: Path, orchestrator: Path) -> None:
         super().__init__(address, DashboardHandler)
