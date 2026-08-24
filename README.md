@@ -8,6 +8,8 @@ Tangle is a local-first engineering workflow that lets Claude Desktop or Claude 
 
 **Claude leads. Codex scales. You stay in control.**
 
+[Visit the Tangle website](https://mmholdings.github.io/tangle/) · [Set up Claude Desktop](docs/CLAUDE_DESKTOP.md)
+
 ## What Tangle does
 
 - Attaches to a clean or dirty coding session without stashing, checking out, staging, resetting, or committing on the user's branch.

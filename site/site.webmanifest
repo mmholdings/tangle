@@ -1,0 +1,16 @@
+{
+  "name": "Tangle",
+  "short_name": "Tangle",
+  "description": "Claude-led, Codex-powered engineering.",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#090b16",
+  "theme_color": "#090b16",
+  "icons": [
+    {
+      "src": "icon.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
