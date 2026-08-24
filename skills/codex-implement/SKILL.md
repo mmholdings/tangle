@@ -1,0 +1,51 @@
+---
+name: codex-implement
+description: Delegate implementation of a Tangle plan (or a scoped part of it) to Codex CLI
+argument-hint: "<plan-path> [instructions] | reset <plan-path> | show <plan-path>"
+---
+
+# Codex Implement
+
+Non-interactive implementation via Codex CLI in a **workspace-write** sandbox: Codex reads the plan, edits the working tree directly, runs the project's lint/build on its own work, and reports back. One persistent thread per target, so a plan can be delegated in successive batches (or phase by phase) with full context retained.
+
+State persisted under `.claude/skills/codex-implement/state/<sanitized-target>.{thread,review.txt,events.ndjson}` (the `.review.txt` file holds Codex's implementation **report** — the naming comes from the shared helpers). All operations go through this skill's own `scripts/` wrappers: `start.sh` is a dedicated workspace-write script, while `resume`/`reset`/`show` pin the correct `STATE_DIR` and delegate to the shared `codex-plan-review` implementation — so there is no `export` to remember (a forgotten export would silently operate on a review thread instead of the implementation thread).
+
+## Arguments
+
+- `<target>` — auto: start if no thread, resume if one exists. Usually a plan path (`docs/1-plans/F_*.plan.md`); a free-form label for unplanned work.
+- Optional trailing instructions — scope control appended to the prompt, e.g. `"Implement only: <batch checkboxes>"` or `"Now implement: <next batch>"`.
+- `reset <target>` — drop state, next call starts fresh.
+- `show <target>` — display the latest report without calling Codex.
+
+## Execution
+
+1. **Parse `$ARGUMENTS`**: extract action (`reset`/`show`/auto) and target.
+
+2. **Auto** — try `start.sh` first (exit code 2 = thread exists → use `resume.sh`):
+   - **Start**: `bash .claude/skills/codex-implement/scripts/start.sh --prompt-file .claude/skills/codex-implement/prompts/implement.tpl <target> [instructions]`
+   - **Resume** (next batch / additional scope): `bash .claude/skills/codex-implement/scripts/resume.sh --prompt-file .claude/skills/codex-implement/prompts/continue.tpl [--notes "review corrections"] <target> [instructions]`
+
+3. **Reset**: `bash .claude/skills/codex-implement/scripts/reset.sh <target>`
+
+4. **Show**: `bash .claude/skills/codex-implement/scripts/show.sh <target>`
+
+5. **Parse trailing tag** of the report:
+   - `IMPLEMENTATION_COMPLETE` — hand control back to the requester's batch review (tangle-2).
+   - `IMPLEMENTATION_PARTIAL` — read the report; resume with instructions for the remainder, or let the requester finish small leftovers directly.
+
+## Notes
+
+- **Run Codex calls in a background shell.** Invoke `start.sh` / `resume.sh` via the Bash tool with `run_in_background: true` — never as a foreground/inline command. Implementation runs are the longest Codex calls in the workflow and will outlast the foreground command timeout; the background task notifies on completion, then read its output. `reset.sh` / `show.sh` are instant and fine in the foreground.
+- **Set `CODEX_TIMEOUT=7200`** (2 h) when invoking `start.sh` / `resume.sh` — a circuit breaker against hung runs only, deliberately far above any normal batch; bump higher for unusually large batches rather than risk a mid-run kill. Script default is `0` = no timeout. A timeout here kills Codex while it is editing the tree, leaving a partially modified working state — inspect via `git status` / `git diff` before retrying.
+- `--sandbox workspace-write` on start; `codex exec resume` inherits it. Codex edits files and runs repo commands (lint/build); no network, no commits.
+- **Fixes are the requester's job.** After Codex reports, the requester (tangle-2 batch review) fixes problems directly in the tree — do NOT ping-pong fixes back to Codex. Resume only for genuinely new scope (next batch, large remainder), passing what was fixed and why via `--notes`.
+- Separate `STATE_DIR` from the review skills — the same plan path can hold an implementation thread and a review thread without collision.
+- Codex is instructed not to write tests (testing gate owns that) and not to touch release ceremony.
+- Network is blocked in the sandbox: if the plan requires installing a new dependency, Codex will report it as a leftover — install it yourself during the batch review.
+- Model/effort/tier defaults live in `codex-plan-review/scripts/_common.sh` (implementation → gpt-5.6-luna at **high** effort on the **fast** service tier; reviews → gpt-5.6-sol at xhigh on standard routing; derived from `STATE_DIR`). Adjust that one file to your preferred models, or override per run via `CODEX_MODEL` / `CODEX_EFFORT` / `CODEX_TIER` env vars; the scripts echo the effective values.
+- **Effort escalation (per batch).** high is the default because plan batches are well-scoped and every batch passes through the requester's delta review plus the final full code review. Escalate a single batch to xhigh (`CODEX_EFFORT=xhigh` on that batch's `start.sh`/`resume.sh` call) when it involves any of:
+  - **novel core logic** designed from scratch — an algorithm, data structure, protocol, or state machine with no existing pattern in the codebase to follow;
+  - **changes the testing gate can't meaningfully verify** — correctness only observable at runtime or by inspection, with no automated check covering it;
+  - **concurrency, security, or data-integrity-sensitive code** — where a subtle slip is costly and hard to spot in review;
+  - **cross-cutting changes** — one batch touching many files or layers whose interactions must stay coherent.
+  When none apply, stay at high — a slipped batch is caught and fixed directly in the delta review.

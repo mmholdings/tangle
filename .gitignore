@@ -1,0 +1,4 @@
+.claude/
+.tangle/
+__pycache__/
+*.pyc

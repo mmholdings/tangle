@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "execution_policy": "codex-first-hybrid",
+  "max_workers": 4,
+  "allow_claude_direct_edits": true,
+  "preserve_selected_claude_model": true,
+  "active_session": {
+    "attach_in_place": true,
+    "snapshot_dirty_tree": true,
+    "include_untracked_nonignored": true,
+    "merge_target": "invoking-session-branch"
+  },
+  "workers": {
+    "adapter": "codex-cli",
+    "sandbox": "workspace-write",
+    "approval_policy": "on-request",
+    "worktree_root": ".tangle/worktrees"
+  },
+  "claude_direct_edit_reasons": [
+    "tiny-change",
+    "architecture-sensitive",
+    "codex-repeated-failure",
+    "integration-conflict",
+    "high-risk-change",
+    "explicit-user-request"
+  ]
+}

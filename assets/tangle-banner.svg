@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 420" role="img" aria-labelledby="title desc">
+  <title id="title">Tangle</title>
+  <desc id="desc">Claude-led, Codex-powered engineering</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#0B1020"/><stop offset="1" stop-color="#17102E"/></linearGradient>
+    <linearGradient id="line" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#2DD4BF"/><stop offset=".5" stop-color="#8B5CF6"/><stop offset="1" stop-color="#FB7185"/></linearGradient>
+    <filter id="glow"><feGaussianBlur stdDeviation="8" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>
+  <rect width="1400" height="420" rx="28" fill="url(#bg)"/>
+  <g opacity=".14" stroke="#D8D5FF"><path d="M0 80H1400M0 160H1400M0 240H1400M0 320H1400"/><path d="M100 0V420M300 0V420M500 0V420M700 0V420M900 0V420M1100 0V420M1300 0V420"/></g>
+  <g transform="translate(120 78)" fill="none" stroke="url(#line)" stroke-width="18" stroke-linecap="round" filter="url(#glow)">
+    <path d="M28 40C112 40 106 220 194 220S280 40 366 40"/>
+    <path d="M28 220C116 220 108 40 194 40s88 180 172 180"/>
+  </g>
+  <g fill="#F8F7FF"><circle cx="148" cy="118" r="12"/><circle cx="314" cy="298" r="12"/><circle cx="486" cy="118" r="12"/></g>
+  <text x="590" y="205" fill="#F8F7FF" font-family="Inter, ui-sans-serif, system-ui" font-size="112" font-weight="750" letter-spacing="-5">Tangle</text>
+  <text x="596" y="270" fill="#B9B6D3" font-family="Inter, ui-sans-serif, system-ui" font-size="30" letter-spacing="1.5">CLAUDE-LED · CODEX-POWERED ENGINEERING</text>
+</svg>
