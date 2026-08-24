@@ -9,10 +9,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=_common.sh
 source "$SCRIPT_DIR/_common.sh"
 
+require_tools python3
+
 if [ $# -ne 1 ]; then
     echo "usage: reset.sh <plan-path>" >&2
     exit 64
 fi
+
+acquire_target_lock "$1"
 
 THREAD_FILE="$(thread_file "$1")"
 REVIEW_FILE="$(review_file "$1")"

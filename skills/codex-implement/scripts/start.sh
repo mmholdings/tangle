@@ -23,7 +23,7 @@ export STATE_DIR
 # shellcheck source=../../codex-plan-review/scripts/_common.sh
 source "$SCRIPT_DIR/../../codex-plan-review/scripts/_common.sh"
 
-require_tools codex jq
+require_tools codex python3
 
 PROMPT_FILE=""
 while [ $# -gt 0 ]; do
@@ -47,6 +47,7 @@ fi
 TARGET="$1"; shift
 EXTRA_PROMPT="${*:-}"
 export TARGET EXTRA_PROMPT
+acquire_target_lock "$TARGET"
 
 THREAD_FILE="$(thread_file "$TARGET")"
 REPORT_FILE="$(review_file "$TARGET")"
@@ -84,8 +85,7 @@ codex_exec exec \
         exit 1
     }
 
-THREAD_ID="$(jq -r 'select(.type == "thread.started") | .thread_id' \
-                "$EVENTS_FILE" 2>/dev/null | head -1)"
+THREAD_ID="$(thread_id_from_events "$EVENTS_FILE")"
 
 if [ -z "$THREAD_ID" ] || [ "$THREAD_ID" = "null" ]; then
     echo "error: no thread.started event found in $EVENTS_FILE" >&2

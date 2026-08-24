@@ -4,71 +4,120 @@
 
 # Tangle
 
-Tangle is a local-first engineering workflow that lets Claude Desktop or Claude Code coordinate a pool of isolated Codex workers without giving up Claude's own coding abilities.
+Tangle is a local-first engineering workflow that lets Claude Desktop or Claude Code coordinate isolated Codex workers while retaining Claude's selected model, full project context, native tools, and ability to code directly.
 
 **Claude leads. Codex scales. You stay in control.**
 
-## Why Tangle
+## What Tangle does
 
-An ordinary coding agent works serially in one checkout. Tangle separates leadership from execution:
+- Attaches to a clean or dirty coding session without stashing, checking out, staging, resetting, or committing on the user's branch.
+- Gives each Codex worker a private Git branch, worktree, dependency-aware base, and non-overlapping ownership scope.
+- Launches, polls, resumes, times out, and cancels Codex CLI workers asynchronously.
+- Rejects uncommitted, empty, unrelated, or out-of-scope worker results.
+- Requires Claude review before acceptance and applies only the accepted worker delta back to the active worktree.
+- Preserves the active Git index during integration, including mid-session staged work.
+- Stores state, prompts, logs, and worker results locally under `.tangle/`.
 
-- Claude keeps the full project conversation, makes architectural decisions, and may code directly.
-- Codex handles routine, separable implementation in parallel worktrees.
-- Every worker owns an explicit scope, commits its result, and returns a compact report.
-- Claude reviews and integrates each result before an independent final review.
-
-The policy is **Codex-first, not Codex-only**. Claude can implement directly when work is small, architecture-sensitive, high-risk, conflict-heavy, repeatedly blocked, or explicitly assigned to Claude.
+The policy is **Codex-first, not Codex-only**. Claude may implement directly when work is small, architecture-sensitive, high-risk, conflict-heavy, repeatedly blocked, or explicitly assigned to Claude.
 
 <p align="center">
   <img src="assets/tangle-system.svg" alt="Tangle execution model" width="860">
 </p>
 
-## Core workflow
+## Requirements
+
+- macOS or Linux
+- Git
+- Python 3.10 or newer
+- Codex CLI, installed and authenticated (Tangle also detects the CLI bundled with ChatGPT for macOS)
+- Claude Code, or a Claude Desktop Code session with local project access
+
+Tangle does not require `jq`, GNU `timeout`, a database, Railway, Redis, or a hosted control plane.
+
+## Install in a project
+
+Clone or download this repository, then run:
+
+```bash
+bash scripts/install.sh /path/to/your-project
+cd /path/to/your-project
+python3 .claude/tangle/tangle_orchestrator.py doctor --config tangle.json
+```
+
+The installer copies the skills to `.claude/skills/`, installs the runtime helper at `.claude/tangle/tangle_orchestrator.py`, and creates `tangle.json` only when one does not already exist. Re-run with `--force` to update installed Tangle files; existing skills and runtime files are backed up under `.claude/tangle/backups/`, and the project's `tangle.json` is preserved.
+
+For a manual install, copy all three items: `skills/` to `.claude/skills/`, `scripts/tangle_orchestrator.py` to `.claude/tangle/tangle_orchestrator.py`, and `tangle.example.json` to `tangle.json`.
+
+## Use from Claude
+
+Start with `/tangle-init YourProject` once. Then use `/tangle-1-plan <feature>`, `/tangle-orchestrate <approved plan>`, or `/tangle-2-implement <plan>`.
+
+The orchestration skill drives the helper, but the equivalent lifecycle is visible here:
+
+```bash
+TANGLE=.claude/tangle/tangle_orchestrator.py
+
+python3 "$TANGLE" init --config tangle.json
+python3 "$TANGLE" snapshot --label active-session
+
+python3 "$TANGLE" create-worker T1 \
+  --title "Implement billing API" \
+  --owns 'src/billing/**' \
+  --acceptance "Billing requests are validated" \
+  --test "pytest tests/billing"
+
+python3 "$TANGLE" launch T1
+python3 "$TANGLE" poll T1
+
+# Claude reviews the committed diff and runs the applicable tests.
+python3 "$TANGLE" accept T1 --review-note "Diff and tests reviewed"
+python3 "$TANGLE" integrate T1
+python3 "$TANGLE" cleanup T1 --delete-branch
+```
+
+`integrate` applies the reviewed worker delta as unstaged changes in Claude's active worktree. It never merges the private snapshot commit and never alters the existing staging area. Claude can inspect, adjust, stage, and commit the combined result normally.
+
+For a dependent task, pass `--depends-on T1`. Tangle starts it only after T1 is accepted, composes T1's accepted changes into the new worker's private base, and later requires T1 to be integrated first.
+
+## Commands
 
 | Command | Purpose |
 | --- | --- |
-| `/tangle-init` | Learn the project and establish architectural memory |
-| `/tangle-1-plan` | Discover requirements and produce a reviewed plan |
-| `/tangle-orchestrate` | Split work across safe parallel Codex worktrees |
-| `/tangle-2-implement` | Implement, test, and review a focused feature |
-| `/tangle-3-release` | Synchronize docs, version, merge, tag, and push |
+| `doctor` | Verify Git, Python, Codex, state, and configuration |
+| `init` | Create state safely; repeated calls preserve existing tasks |
+| `configure` | Reload a validated `tangle.json` without resetting tasks |
+| `snapshot` | Capture the current clean or dirty session non-destructively |
+| `create-worker` | Validate dependencies and ownership, then create a worktree |
+| `launch` / `poll` | Run Codex asynchronously and collect its result |
+| `resume` / `cancel` | Give bounded feedback or safely stop a worker |
+| `complete` | Validate a worker completed outside the built-in launcher |
+| `accept` | Record Claude's review gate |
+| `integrate` | Apply only the reviewed task delta, preserving the index |
+| `cleanup` / `reconcile` | Safely retire tasks or repair stale local metadata |
+| `status` | Print compact persistent task state |
 
-Supporting skills provide research, hotfix, testing, review, compaction, upgrades, and direct Codex operations.
+Use `python3 .claude/tangle/tangle_orchestrator.py <command> --help` for command-specific options.
 
-## Install
+## Configuration
 
-1. Copy the contents of `skills/` into your project's `.claude/skills/` directory.
-2. Copy `tangle.example.json` to `tangle.json` and adjust worker limits if needed.
-3. Ensure Git, Python 3, and Codex CLI are installed and authenticated.
-4. Run `/tangle-init YourProject` once, then use `/tangle-1-plan <feature>` or `/tangle-orchestrate <approved plan>`.
+The checked-in [tangle.example.json](tangle.example.json) is the complete schema. Tangle rejects unknown fields, wrong types, unsafe worktree paths, unsupported adapters, and `danger-full-access` workers with concise errors.
 
-## Attach during an active coding session
+The default worker is `gpt-5.6-luna` at `high` reasoning on the fast service tier. Change the Codex worker model in `tangle.json` and run `configure`; this does not change Claude's selected model. Worker attempts default to a 30-minute timeout and one bounded retry.
 
-Tangle can start after Claude has already made staged, unstaged, and untracked changes:
-
-```bash
-python3 scripts/tangle_orchestrator.py init --config tangle.json
-python3 scripts/tangle_orchestrator.py snapshot --label active-session
-python3 scripts/tangle_orchestrator.py create-worker T1 \
-  --title "Implement billing API" \
-  --owns 'src/billing/**'
-python3 scripts/tangle_orchestrator.py status
-```
-
-The snapshot uses a temporary Git index and a private commit ref. It does not switch branches, touch the real staging area, stash files, or alter the active worktree. Each worker receives an isolated worktree based on the exact snapshot.
-
-> Nonignored untracked files are included. Keep secrets and machine-local files in `.gitignore` before starting Tangle.
+Nonignored untracked files enter dirty-session snapshots by default so workers see what Claude sees. Keep secrets and machine-local files in `.gitignore`, or set `active_session.include_untracked_nonignored` to `false`.
 
 ## Where it runs
 
-Tangle runs on your computer because it needs local access to Git, source files, tests, build tools, and Codex. GitHub stores and distributes the project; it is not Tangle's backend. No Railway service, database, Redis instance, or hosted queue is required.
+Tangle runs on your computer because it needs local source files, Git, build tools, and the authenticated Codex CLI. GitHub hosts and distributes Tangle; it is not the orchestration backend.
 
-## Project status
+Runtime state is excluded locally through `.git/info/exclude` during initialization, even when the host repository has not added `.tangle/` to its own `.gitignore`.
 
-The repository currently contains the workflow and a tested local orchestration foundation. Asynchronous Codex adapters, automated ownership enforcement, integration queues, and Desktop Extension packaging are tracked in [BUILDOUT.md](BUILDOUT.md).
+## Reliability
 
-See [the architecture](docs/ARCHITECTURE.md) and [build prompt](BUILD_PROMPT.md) for the complete design contract.
+The standard-library test suite covers dirty snapshots, ignored secrets, staged and untracked files, concurrent state updates, dependency composition, ownership enforcement, review gates, active-index preservation, installation, Unicode token counting, and the asynchronous worker lifecycle. GitHub Actions runs it on macOS and Linux with Python 3.10 and 3.12.
 
-## Brand
+See [the architecture](docs/ARCHITECTURE.md), [delivered buildout](BUILDOUT.md), and [continuation prompt](BUILD_PROMPT.md).
 
-Tangle's visual system uses a midnight field, electric violet, signal aqua, and coral. Intersecting paths represent independent agents converging on one reviewed result.
+## License
+
+No open-source license is currently granted. The copyright holder retains all rights.

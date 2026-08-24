@@ -1,19 +1,21 @@
-# Tangle implementation prompt
+# Tangle continuation prompt
 
-Build Tangle as a local-first, Claude-led orchestration system for parallel Codex workers.
+Extend the existing Tangle v0.2.0 implementation; do not replace its safety model or rebuild it as a scaffold.
 
-Claude remains the engineering lead and retains its selected model, native coding tools, subagents, full project context, and direct-edit authority. Apply a **Codex-first hybrid** policy: delegate large, routine, separable implementation to Codex; let Claude implement small changes, architecture-sensitive or high-risk work, integration conflicts, tasks after repeated worker failure, and anything explicitly assigned to Claude.
+Tangle is local-first, Claude-led, and Codex-powered. Claude must retain the user's selected model, native tools, full coding authority, and project context. Keep the **Codex-first hybrid** policy: delegate large, routine, separable work to Codex while allowing Claude to implement directly when work is small, architecture-sensitive, high-risk, conflict-heavy, repeatedly blocked, or explicitly assigned to Claude.
 
-Required behavior:
+Preserve these tested invariants:
 
-1. Attach safely to an already-running dirty coding session. Capture staged, unstaged, and nonignored untracked files through a temporary Git index and private snapshot commit/ref. Never checkout, stash, stage, reset, clean, or commit on the user's branch.
-2. Decompose an approved plan into dependency-aware tasks with explicit acceptance criteria, tests, and non-overlapping ownership globs.
-3. Create one `tangle/*` Git branch and `.tangle/worktrees/*` worktree per worker from the active-session snapshot or clean HEAD.
-4. Run Codex workers asynchronously through an adapter boundary supporting CLI and MCP implementations.
-5. Require workers to commit and return only status, commit, files changed, tests, and unresolved issues.
-6. Have Claude review diffs, enforce ownership, run tests, integrate dependency-first, and take ownership when direct implementation is more appropriate.
-7. Run an independent Codex final review before release.
-8. Store runtime data only under `.tangle/`. Do not require Railway, Redis, Postgres, or any remote control plane.
-9. Add tests for snapshot non-mutation, secret/ignore behavior, worktree isolation, ownership enforcement, dependency scheduling, resumable state, and safe cleanup.
+1. Dirty-session snapshots use a temporary index and private ref. They never stash, checkout, stage, reset, clean, or commit on the user's branch.
+2. State updates are atomic and locked across every read → Git mutation → write transaction.
+3. Task ownership is non-overlapping while active and is enforced against the committed worker diff.
+4. Dependencies must be accepted before scheduling and their accepted deltas must be composed into downstream private bases.
+5. Workers run in isolated worktrees with bounded timeouts and retries. Cancellation must verify process identity before signaling.
+6. A worker result remains in review until Claude validates and accepts it.
+7. Integration applies only `task.base_commit..task.commit` to the active worktree, leaves it unstaged, preserves the real index, and never merges a dirty-session snapshot commit.
+8. Runtime data stays under `.tangle/`; no hosted backend is required.
+9. Public names, paths, commands, examples, and skill instructions remain under the Tangle brand.
 
-Keep Tangle's public names, commands, paths, documentation, and interface internally consistent. Before release, run all tests, inspect the final tree, and verify the GitHub default branch and displayed README.
+Before accepting any extension, add behavior-focused tests for macOS and Linux, run the complete test suite, validate every shell script, scan for stale branding and unresolved template markers outside intentional initialization templates, and synchronize README.md, BUILDOUT.md, this prompt, docs/ARCHITECTURE.md, `tangle.example.json`, and `skills/tangle-orchestrate/SKILL.md`.
+
+Suitable next projects are a stable `CodexAdapter` protocol with an MCP implementation, signed Claude Desktop Extension packaging, an optional read-only local dashboard, or a cross-platform locking/process backend for Windows. None may weaken Claude's authority or make a remote service mandatory.

@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=_common.sh
 source "$SCRIPT_DIR/_common.sh"
 
-require_tools codex
+require_tools codex python3
 
 PROMPT_FILE=""
 IMPLEMENTER_NOTES=""
@@ -40,6 +40,7 @@ fi
 TARGET="$1"; shift
 EXTRA_PROMPT="${*:-}"
 export TARGET EXTRA_PROMPT IMPLEMENTER_NOTES
+acquire_target_lock "$TARGET"
 
 THREAD_FILE="$(thread_file "$TARGET")"
 REVIEW_FILE="$(review_file "$TARGET")"

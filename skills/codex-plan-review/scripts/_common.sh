@@ -49,9 +49,8 @@ export CODEX_TIMEOUT
 # TERM first, KILL 10s later. GNU timeout exits 124 on expiry, which flows
 # through the call sites' existing `|| { ... }` failure handling; the
 # "timed out" message below lands in the redirected stderr file, so the
-# handlers' stderr tail surfaces it. macOS has no stock `timeout` — fall
-# back to gtimeout (brew coreutils), and warn rather than silently running
-# unbounded when neither exists.
+# handlers' stderr tail surfaces it. macOS has no stock `timeout`, so a
+# Python fallback supplies the same bounded behavior without Homebrew.
 codex_exec() {
     if [ "$CODEX_TIMEOUT" -eq 0 ]; then
         codex "$@"
@@ -64,9 +63,26 @@ codex_exec() {
         timeout_bin=gtimeout
     fi
     if [ -z "$timeout_bin" ]; then
-        echo "warning: CODEX_TIMEOUT=$CODEX_TIMEOUT is set but neither 'timeout' nor 'gtimeout' is available; running unbounded (macOS: brew install coreutils)" >&2
-        codex "$@"
-        return
+        local rc=0
+        python3 -c '
+import os, signal, subprocess, sys
+seconds = int(sys.argv[1])
+process = subprocess.Popen(sys.argv[2:], start_new_session=True)
+try:
+    raise SystemExit(process.wait(timeout=seconds))
+except subprocess.TimeoutExpired:
+    os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+    raise SystemExit(124)
+' "$CODEX_TIMEOUT" codex "$@" || rc=$?
+        if [ "$rc" -eq 124 ]; then
+            echo "error: codex timed out after ${CODEX_TIMEOUT}s (CODEX_TIMEOUT)" >&2
+        fi
+        return "$rc"
     fi
     local rc=0
     "$timeout_bin" --signal=TERM --kill-after=10 "$CODEX_TIMEOUT" codex "$@" || rc=$?
@@ -97,7 +113,7 @@ require_tools() {
 target_key() {
     local target="$1" resolved sanitized sum
     if [ -e "$target" ]; then
-        resolved="$(realpath -- "$target" 2>/dev/null || readlink -f -- "$target")"
+        resolved="$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "$target")"
         if [ -z "$resolved" ]; then
             echo "error: cannot resolve target path: $target" >&2
             return 1
@@ -106,8 +122,68 @@ target_key() {
         resolved="$target"
     fi
     sanitized="$(printf '%s' "$resolved" | sed 's|^/||; s|/|__|g; s|[^A-Za-z0-9._-]|_|g')"
+    sanitized="$(printf '%s' "$sanitized" | cut -c1-120)"
     sum="$(printf '%s' "$resolved" | cksum | cut -d' ' -f1)"
     printf '%s.%s' "$sanitized" "$sum"
+}
+
+TARGET_LOCK_DIR=""
+
+release_target_lock() {
+    if [ -n "$TARGET_LOCK_DIR" ] && [ -d "$TARGET_LOCK_DIR" ]; then
+        rm -f -- "$TARGET_LOCK_DIR/pid"
+        rmdir -- "$TARGET_LOCK_DIR" 2>/dev/null || true
+    fi
+    TARGET_LOCK_DIR=""
+}
+
+# Prevent two start/resume/reset commands from mutating the same target state.
+# A PID marker permits recovery after a process was killed without running its
+# EXIT trap.
+acquire_target_lock() {
+    local key lock owner attempt
+    key="$(target_key "$1")"
+    mkdir -p "$STATE_DIR/.locks"
+    lock="$STATE_DIR/.locks/$key"
+    for attempt in 1 2; do
+        if mkdir -- "$lock" 2>/dev/null; then
+            printf '%s\n' "$$" > "$lock/pid"
+            TARGET_LOCK_DIR="$lock"
+            trap release_target_lock EXIT
+            return 0
+        fi
+        owner="$(cat "$lock/pid" 2>/dev/null || true)"
+        case "$owner" in
+            ''|*[!0-9]*) owner="" ;;
+        esac
+        if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+            echo "error: another Codex operation is active for $1 (pid $owner)" >&2
+            return 75
+        fi
+        rm -f -- "$lock/pid" 2>/dev/null || true
+        rmdir -- "$lock" 2>/dev/null || true
+    done
+    echo "error: could not acquire Codex state lock for $1" >&2
+    return 75
+}
+
+# Extract the first Codex thread id without requiring jq (not installed by
+# default on macOS).
+thread_id_from_events() {
+    python3 - "$1" <<'PY'
+import json
+import pathlib
+import sys
+
+for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines():
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if event.get("type") == "thread.started" and event.get("thread_id"):
+        print(event["thread_id"])
+        break
+PY
 }
 
 # Backwards-compatible alias used by older script call sites.

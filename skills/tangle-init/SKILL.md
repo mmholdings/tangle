@@ -18,7 +18,7 @@ Tangle is a structured development workflow with four phases:
 - **R**eview - Systematic code review
 - **T**est - Comprehensive testing
 
-Why call it Tangle instead of PIRT? Because why not
+The phases form one connected delivery path: decisions, implementation, review, and evidence stay linked instead of becoming separate handoffs.
 
 ---
 

@@ -12,9 +12,16 @@
   },
   "workers": {
     "adapter": "codex-cli",
+    "command": "codex",
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "high",
+    "service_tier": "fast",
     "sandbox": "workspace-write",
     "approval_policy": "on-request",
-    "worktree_root": ".tangle/worktrees"
+    "worktree_root": ".tangle/worktrees",
+    "timeout_seconds": 1800,
+    "max_retries": 1,
+    "allow_noop": false
   },
   "claude_direct_edit_reasons": [
     "tiny-change",
