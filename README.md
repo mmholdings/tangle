@@ -72,7 +72,3 @@ See [the architecture](docs/ARCHITECTURE.md) and [build prompt](BUILD_PROMPT.md)
 ## Brand
 
 Tangle's visual system uses a midnight field, electric violet, signal aqua, and coral. Intersecting paths represent independent agents converging on one reviewed result.
-
-## Provenance
-
-Tangle is an independently branded evolution of ideas first explored in an earlier open-source workflow. Historical provenance is recorded in [NOTICE.md](NOTICE.md); that project is not part of Tangle's product identity.
