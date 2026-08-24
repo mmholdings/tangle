@@ -17,6 +17,8 @@ Tangle is a local-first engineering workflow that lets Claude Desktop or Claude 
 - Requires Claude review before acceptance and applies only the accepted worker delta back to the active worktree.
 - Preserves the active Git index during integration, including mid-session staged work.
 - Stores state, prompts, logs, and worker results locally under `.tangle/`.
+- Gives Claude Desktop the same bounded lifecycle through an installable MCP Bundle.
+- Includes a localhost-only dashboard for task visibility, polling, and reconciliation.
 
 The policy is **Codex-first, not Codex-only**. Claude may implement directly when work is small, architecture-sensitive, high-risk, conflict-heavy, repeatedly blocked, or explicitly assigned to Claude.
 
@@ -44,9 +46,33 @@ cd /path/to/your-project
 python3 .claude/tangle/tangle_orchestrator.py doctor --config tangle.json
 ```
 
-The installer copies the skills to `.claude/skills/`, installs the runtime helper at `.claude/tangle/tangle_orchestrator.py`, and creates `tangle.json` only when one does not already exist. Re-run with `--force` to update installed Tangle files; existing skills and runtime files are backed up under `.claude/tangle/backups/`, and the project's `tangle.json` is preserved.
+The installer copies the skills to `.claude/skills/`, installs the orchestrator, MCP adapter, and dashboard under `.claude/tangle/`, and creates `tangle.json` only when one does not already exist. Re-run with `--force` to update installed Tangle files; existing skills and runtime files are backed up under `.claude/tangle/backups/`, and the project's `tangle.json` is preserved.
 
-For a manual install, copy all three items: `skills/` to `.claude/skills/`, `scripts/tangle_orchestrator.py` to `.claude/tangle/tangle_orchestrator.py`, and `tangle.example.json` to `tangle.json`.
+For a manual install, copy `skills/` to `.claude/skills/`, the three `scripts/tangle_*.py` runtime files to `.claude/tangle/`, and `tangle.example.json` to `tangle.json`.
+
+## Claude Desktop extension on Mac
+
+Tangle ships as a current MCP Bundle (`.mcpb`), the format that replaced the older `.dxt` extension name. Build it with:
+
+```bash
+python3 scripts/build_mcpb.py
+```
+
+Then in Claude Desktop open **Settings → Extensions → Advanced settings → Install Extension…**, choose `dist/tangle.mcpb`, and select the root folder of the Git project you want Tangle to manage. The bundle contains the MCP adapter, orchestrator, dashboard, and icon; it does not install a server or send Tangle state to a hosted Tangle service.
+
+The extension fixes its access to the one project folder selected during installation. Its MCP tools have no arbitrary shell command or arbitrary-path escape. Claude can use the full worker lifecycle, but `accept` remains an explicit review action and `integrate` still revalidates the accepted commit and preserves the index.
+
+See [Claude Desktop and MCP setup](docs/CLAUDE_DESKTOP.md) for installation, Claude Code registration, updating, and troubleshooting.
+
+## Local dashboard
+
+Open the dashboard directly from an installed project:
+
+```bash
+python3 .claude/tangle/tangle_dashboard.py --repo "$PWD" --open
+```
+
+Or ask Claude to use `tangle_open_dashboard` through the extension. The dashboard binds only to `127.0.0.1`, loads no remote assets, requires a per-process token for actions, rejects non-local Host headers, and exposes only **poll** and **reconcile**. It cannot accept or integrate worker output. Use **Stop dashboard** in the page when finished.
 
 ## Use from Claude
 
@@ -96,6 +122,8 @@ For a dependent task, pass `--depends-on T1`. Tangle starts it only after T1 is 
 | `cleanup` / `reconcile` | Safely retire tasks or repair stale local metadata |
 | `status` | Print compact persistent task state |
 
+The MCP adapter exposes bounded equivalents of these lifecycle commands plus `tangle_open_dashboard`. It deliberately exposes no generic command runner.
+
 Use `python3 .claude/tangle/tangle_orchestrator.py <command> --help` for command-specific options.
 
 ## Configuration
@@ -114,7 +142,7 @@ Runtime state is excluded locally through `.git/info/exclude` during initializat
 
 ## Reliability
 
-The standard-library test suite covers dirty snapshots, ignored secrets, staged and untracked files, concurrent state updates, dependency composition, ownership enforcement, review gates, active-index preservation, installation, Unicode token counting, and the asynchronous worker lifecycle. GitHub Actions runs it on macOS and Linux with Python 3.10 and 3.12.
+The standard-library test suite covers dirty snapshots, ignored secrets, staged and untracked files, concurrent state updates, dependency composition, ownership enforcement, review gates, active-index preservation, installation, Unicode token counting, the asynchronous worker lifecycle, MCP negotiation and tool boundaries, dashboard security, and reproducible MCP Bundle packaging. GitHub Actions runs it on macOS and Linux with Python 3.10 and 3.12.
 
 See [the architecture](docs/ARCHITECTURE.md), [delivered buildout](BUILDOUT.md), and [continuation prompt](BUILD_PROMPT.md).
 

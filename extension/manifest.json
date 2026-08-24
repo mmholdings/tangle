@@ -1,0 +1,70 @@
+{
+  "manifest_version": "0.3",
+  "name": "tangle",
+  "display_name": "Tangle",
+  "version": "0.3.0",
+  "description": "Claude-led, Codex-powered local engineering with isolated workers and review-gated integration.",
+  "long_description": "Tangle lets Claude Desktop remain the engineering lead while it delegates scoped implementation work to parallel Codex workers. It attaches safely to clean or dirty Git sessions, uses private worktrees, enforces file ownership, and requires Claude review before an accepted delta can be integrated. The runtime and dashboard stay on your computer.",
+  "author": {
+    "name": "MM Holdings",
+    "url": "https://github.com/mmholdings"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mmholdings/tangle.git"
+  },
+  "homepage": "https://github.com/mmholdings/tangle",
+  "documentation": "https://github.com/mmholdings/tangle#readme",
+  "support": "https://github.com/mmholdings/tangle/issues",
+  "icon": "icon.png",
+  "server": {
+    "type": "python",
+    "entry_point": "server/tangle_mcp_server.py",
+    "mcp_config": {
+      "command": "python3",
+      "args": [
+        "${__dirname}/server/tangle_mcp_server.py",
+        "--repo",
+        "${user_config.project_root}",
+        "--orchestrator",
+        "${__dirname}/server/tangle_orchestrator.py",
+        "--dashboard",
+        "${__dirname}/server/tangle_dashboard.py"
+      ]
+    }
+  },
+  "tools": [
+    {"name": "tangle_doctor", "description": "Check local Tangle prerequisites and state."},
+    {"name": "tangle_status", "description": "Read branch, snapshot, and worker state."},
+    {"name": "tangle_initialize", "description": "Initialize local Tangle state safely."},
+    {"name": "tangle_snapshot", "description": "Capture a non-destructive active-session snapshot."},
+    {"name": "tangle_create_worker", "description": "Create an isolated, scoped Codex worker."},
+    {"name": "tangle_launch_worker", "description": "Launch a scoped Codex worker asynchronously."},
+    {"name": "tangle_poll", "description": "Collect and validate completed worker outcomes."},
+    {"name": "tangle_resume_worker", "description": "Resume a worker with bounded feedback."},
+    {"name": "tangle_accept_worker", "description": "Record Claude's completed review gate."},
+    {"name": "tangle_integrate_worker", "description": "Apply only an accepted worker delta."},
+    {"name": "tangle_cancel_worker", "description": "Stop or abandon a verified worker process."},
+    {"name": "tangle_cleanup_worker", "description": "Clean up a terminal worker worktree."},
+    {"name": "tangle_open_dashboard", "description": "Open the localhost-only Tangle dashboard."}
+  ],
+  "tools_generated": false,
+  "keywords": ["claude", "codex", "git", "worktrees", "engineering", "orchestration"],
+  "privacy_policies": ["https://openai.com/policies/privacy-policy/"],
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": ["darwin", "linux"],
+    "runtimes": {
+      "python": ">=3.10,<4.0"
+    }
+  },
+  "user_config": {
+    "project_root": {
+      "type": "directory",
+      "title": "Project folder",
+      "description": "Select the root of the Git project Claude should manage with Tangle.",
+      "required": true,
+      "default": "${DOCUMENTS}"
+    }
+  }
+}

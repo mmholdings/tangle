@@ -22,7 +22,7 @@ from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 STATE_VERSION = 2
 ACTIVE_STATUSES = {"ready", "running", "review"}
 TERMINAL_STATUSES = {"integrated", "canceled", "failed"}

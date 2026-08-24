@@ -2,17 +2,24 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import urllib.error
+import urllib.request
+import zipfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ORCHESTRATOR = PROJECT_ROOT / "scripts" / "tangle_orchestrator.py"
 TOKEN_COUNTER = PROJECT_ROOT / "skills" / "tangle-compact" / "count-tokens.sh"
 INSTALLER = PROJECT_ROOT / "scripts" / "install.sh"
+MCP_SERVER = PROJECT_ROOT / "scripts" / "tangle_mcp_server.py"
+DASHBOARD = PROJECT_ROOT / "scripts" / "tangle_dashboard.py"
+MCPB_BUILDER = PROJECT_ROOT / "scripts" / "build_mcpb.py"
 
 
 class RepoCase(unittest.TestCase):
@@ -516,6 +523,12 @@ class UtilityTests(unittest.TestCase):
             helper = target / ".claude" / "tangle" / "tangle_orchestrator.py"
             self.assertTrue(helper.is_file())
             self.assertTrue(
+                (target / ".claude" / "tangle" / "tangle_mcp_server.py").is_file()
+            )
+            self.assertTrue(
+                (target / ".claude" / "tangle" / "tangle_dashboard.py").is_file()
+            )
+            self.assertTrue(
                 (
                     target / ".claude" / "skills" / "tangle-orchestrate" / "SKILL.md"
                 ).is_file()
@@ -574,6 +587,247 @@ class UtilityTests(unittest.TestCase):
             )
             self.assertIn("tokens", result.stdout)
             self.assertNotIn("multibyte conversion failure", result.stderr)
+
+
+class ProductLayerTests(RepoCase):
+    def mcp_call(
+        self, process: subprocess.Popen[str], request_id: int, method: str, params: dict | None = None
+    ) -> dict:
+        assert process.stdin is not None
+        assert process.stdout is not None
+        request = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            request["params"] = params
+        process.stdin.write(json.dumps(request) + "\n")
+        process.stdin.flush()
+        line = process.stdout.readline()
+        self.assertTrue(line, f"MCP server exited while handling {method}")
+        return json.loads(line)
+
+    def test_mcp_adapter_initializes_and_exposes_scoped_tools(self) -> None:
+        self.config()
+        dashboard_url = ""
+        dashboard_token = ""
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(MCP_SERVER),
+                "--repo",
+                str(self.root),
+                "--orchestrator",
+                str(ORCHESTRATOR),
+                "--dashboard",
+                str(DASHBOARD),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            initialized = self.mcp_call(
+                process,
+                1,
+                "initialize",
+                {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "tests", "version": "1"},
+                },
+            )
+            self.assertEqual("2025-11-25", initialized["result"]["protocolVersion"])
+            tools = self.mcp_call(process, 2, "tools/list")["result"]["tools"]
+            names = {tool["name"] for tool in tools}
+            by_name = {tool["name"]: tool for tool in tools}
+            self.assertIn("tangle_open_dashboard", names)
+            self.assertIn("tangle_accept_worker", names)
+            self.assertNotIn("shell", " ".join(names))
+            self.assertTrue(by_name["tangle_status"]["annotations"]["readOnlyHint"])
+            self.assertTrue(by_name["tangle_launch_worker"]["annotations"]["openWorldHint"])
+            self.assertTrue(by_name["tangle_integrate_worker"]["annotations"]["destructiveHint"])
+
+            init = self.mcp_call(
+                process,
+                3,
+                "tools/call",
+                {"name": "tangle_initialize", "arguments": {}},
+            )["result"]
+            self.assertFalse(init["isError"], init)
+            status = self.mcp_call(
+                process,
+                4,
+                "tools/call",
+                {"name": "tangle_status", "arguments": {}},
+            )["result"]
+            self.assertEqual("main", status["structuredContent"]["result"]["branch"])
+            unknown = self.mcp_call(
+                process,
+                5,
+                "tools/call",
+                {"name": "run_shell", "arguments": {"command": "touch escaped"}},
+            )["result"]
+            self.assertTrue(unknown["isError"])
+            self.assertFalse((self.root / "escaped").exists())
+
+            opened = self.mcp_call(
+                process,
+                6,
+                "tools/call",
+                {
+                    "name": "tangle_open_dashboard",
+                    "arguments": {"port": 0, "open_browser": False},
+                },
+            )["result"]
+            self.assertFalse(opened["isError"], opened)
+            dashboard_url = opened["structuredContent"]["result"]["url"]
+            with urllib.request.urlopen(dashboard_url, timeout=2) as response:
+                markup = response.read().decode("utf-8")
+            token_match = re.search(
+                r'<meta name="tangle-token" content="([^"]+)">', markup
+            )
+            self.assertIsNotNone(token_match)
+            dashboard_token = token_match.group(1) if token_match else ""
+            reused = self.mcp_call(
+                process,
+                7,
+                "tools/call",
+                {
+                    "name": "tangle_open_dashboard",
+                    "arguments": {"port": 0, "open_browser": False},
+                },
+            )["result"]
+            self.assertTrue(reused["structuredContent"]["result"]["reused"])
+        finally:
+            if dashboard_url and dashboard_token:
+                shutdown = urllib.request.Request(
+                    dashboard_url + "api/shutdown",
+                    data=b"",
+                    headers={"X-Tangle-Token": dashboard_token},
+                    method="POST",
+                )
+                try:
+                    with urllib.request.urlopen(shutdown, timeout=2):
+                        pass
+                except urllib.error.URLError:
+                    pass
+            if process.stdin:
+                process.stdin.close()
+            process.wait(timeout=5)
+            stderr = process.stderr.read() if process.stderr else ""
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
+            if process.returncode:
+                self.fail(f"MCP server exited {process.returncode}: {stderr}")
+
+    def test_local_dashboard_is_loopback_token_protected_and_review_safe(self) -> None:
+        self.config()
+        self.cli("init")
+        info = self.root / ".tangle" / "dashboard-test.json"
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(DASHBOARD),
+                "--repo",
+                str(self.root),
+                "--orchestrator",
+                str(ORCHESTRATOR),
+                "--port",
+                "0",
+                "--write-info",
+                str(info),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not info.is_file():
+                time.sleep(0.05)
+            details = json.loads(info.read_text(encoding="utf-8"))
+            url = details["url"]
+            self.assertTrue(url.startswith("http://127.0.0.1:"), url)
+            with urllib.request.urlopen(url, timeout=2) as response:
+                markup = response.read().decode("utf-8")
+                self.assertEqual("DENY", response.headers["X-Frame-Options"])
+                self.assertIn("no-store", response.headers["Cache-Control"])
+            match = re.search(r'<meta name="tangle-token" content="([^"]+)">', markup)
+            self.assertIsNotNone(match)
+            token = match.group(1) if match else ""
+            with urllib.request.urlopen(url + "api/status", timeout=2) as response:
+                state = json.loads(response.read().decode("utf-8"))
+            self.assertTrue(state["initialized"])
+
+            unauthorized = urllib.request.Request(
+                url + "api/action",
+                data=json.dumps({"action": "poll"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as denied:
+                urllib.request.urlopen(unauthorized, timeout=2)
+            self.assertEqual(403, denied.exception.code)
+            denied.exception.close()
+
+            forbidden_gate = urllib.request.Request(
+                url + "api/action",
+                data=json.dumps({"action": "accept"}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "X-Tangle-Token": token},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as rejected:
+                urllib.request.urlopen(forbidden_gate, timeout=2)
+            self.assertEqual(400, rejected.exception.code)
+            rejected.exception.close()
+
+            shutdown = urllib.request.Request(
+                url + "api/shutdown",
+                data=b"",
+                headers={"X-Tangle-Token": token},
+                method="POST",
+            )
+            with urllib.request.urlopen(shutdown, timeout=2) as response:
+                self.assertTrue(json.loads(response.read().decode("utf-8"))["ok"])
+            process.wait(timeout=5)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
+
+    def test_mcp_bundle_is_complete_and_reproducible(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tangle-mcpb-") as temporary:
+            first = Path(temporary) / "first.mcpb"
+            second = Path(temporary) / "second.mcpb"
+            for target in (first, second):
+                subprocess.run(
+                    [sys.executable, str(MCPB_BUILDER), "--output", str(target)],
+                    cwd=PROJECT_ROOT,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            with zipfile.ZipFile(first) as bundle:
+                self.assertEqual(
+                    {
+                        "icon.png",
+                        "manifest.json",
+                        "server/tangle_dashboard.py",
+                        "server/tangle_mcp_server.py",
+                        "server/tangle_orchestrator.py",
+                    },
+                    set(bundle.namelist()),
+                )
+                manifest = json.loads(bundle.read("manifest.json"))
+                self.assertEqual("0.3", manifest["manifest_version"])
+                self.assertEqual("tangle", manifest["name"])
+                self.assertEqual("server/tangle_mcp_server.py", manifest["server"]["entry_point"])
 
 
 if __name__ == "__main__":

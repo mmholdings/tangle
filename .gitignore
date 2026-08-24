@@ -2,3 +2,4 @@
 .tangle/
 __pycache__/
 *.pyc
+dist/

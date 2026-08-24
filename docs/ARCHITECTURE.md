@@ -6,10 +6,12 @@
 User
   └─ Claude Desktop / Claude Code (selected Claude model stays active)
        ├─ architecture, direct coding, debugging, review, integration
-       └─ Tangle local runtime
-            ├─ Codex worker A → branch + worktree A
-            ├─ Codex worker B → branch + worktree B
-            └─ Codex reviewer  → independent final review
+       └─ Tangle MCP adapter / skills
+            └─ Tangle local runtime
+                 ├─ Codex worker A → branch + worktree A
+                 ├─ Codex worker B → branch + worktree B
+                 ├─ Codex reviewer  → independent final review
+                 └─ dashboard      → local status / poll / reconcile
 ```
 
 Claude is always the engineering lead. Tangle adds a Codex execution pool; it does not replace Claude's model, context, tools, or authority.
@@ -19,10 +21,27 @@ Claude is always the engineering lead. Tangle adds a Codex execution pool; it do
 - `.claude/skills/tangle-*` — Claude-facing planning, implementation, review, test, release, and orchestration workflows.
 - `.claude/skills/codex-*` — focused Codex implementation and second-opinion wrappers.
 - `.claude/tangle/tangle_orchestrator.py` — installed local runtime; the repository source is `scripts/tangle_orchestrator.py`.
+- `.claude/tangle/tangle_mcp_server.py` — dependency-free, newline-delimited JSON-RPC MCP adapter fixed to one selected Git root.
+- `.claude/tangle/tangle_dashboard.py` — loopback-only task dashboard with a narrow action allowlist.
+- `extension/manifest.json` and `scripts/build_mcpb.py` — source and deterministic builder for the Claude Desktop `.mcpb` package.
 - `tangle.json` — validated project configuration.
 - Git branches, private refs, and worktrees — isolation and durable worker artifacts.
 
 The runtime uses only the Python standard library and Git. `fcntl` state locking and Unix process groups make the current release a macOS/Linux runtime.
+
+## MCP boundary
+
+The MCP adapter runs over the standard stdio transport and negotiates supported protocol versions through JSON-RPC. Claude Desktop chooses one project root during extension installation; the server resolves that path and requires it to equal the Git top-level directory. Tool arguments cannot replace the root, select an executable, or submit a shell command.
+
+Each MCP tool maps to a fixed orchestrator argument sequence with explicit type checks, unknown-argument rejection, a message-size limit, and a command timeout. Read-only and destructive annotations are hints for clients, while the orchestrator remains the enforcement boundary. A successful worker process still stops at `review`; acceptance and integration remain separate tools with the same revalidation performed by the CLI.
+
+The MCP Bundle uses the current `manifest_version: 0.3` package format and bundles only standard-library Python files and its local icon. The build is deterministic and its contents are tested.
+
+## Dashboard boundary
+
+The dashboard binds to `127.0.0.1`, uses no CDN or analytics, sends no permissive CORS header, rejects non-local Host headers, and applies no-store, framing, content-type, referrer, and content-security headers. Mutating requests require a random per-process token embedded only in the same-origin page. The body size and action set are bounded.
+
+Its only orchestration actions are `poll` and `reconcile`. It cannot create, launch, resume, cancel, accept, integrate, clean up, run a shell command, or read another project. A local **Stop dashboard** control performs a token-protected graceful shutdown.
 
 ## Local state
 
@@ -94,4 +113,4 @@ Expected failures return concise errors without tracebacks. Cleanup refuses acti
 
 ## Deployment and trust boundary
 
-The execution core remains local because it needs source files, Git, credentials, processes, and build tools. GitHub hosts the repository and collaboration history. An optional future dashboard may consume sanitized events, but it must not receive source by default or become required for execution.
+The execution core, MCP process, and dashboard remain local because they need source files, Git, credentials, processes, and build tools. GitHub hosts the repository and collaboration history. Claude Desktop sends MCP tool calls to the local adapter; Codex CLI separately uses the user's authenticated Codex service when a worker is launched. No Tangle-hosted backend exists, and neither the MCP adapter nor dashboard is required for the CLI workflow.

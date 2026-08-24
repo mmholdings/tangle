@@ -21,6 +21,8 @@ python3 "$TANGLE" doctor --config tangle.json
 python3 "$TANGLE" init --config tangle.json
 ```
 
+When Tangle MCP tools are connected, prefer their equivalent fixed-project operations for status and lifecycle actions. The CLI remains the fallback and the enforcement behavior is identical. Never substitute an arbitrary shell or file tool for a Tangle review-gated operation merely because MCP is unavailable.
+
 If the tree is dirty, run `snapshot --label active-session`. The helper must preserve the branch, HEAD, files, and real index. Never use stash, reset, clean, checkout, or a temporary commit on the user's branch.
 
 ## Decide and decompose

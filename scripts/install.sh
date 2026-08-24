@@ -50,7 +50,11 @@ if [ "$force" -eq 1 ]; then
   done
   if [ -e "$runtime_target/tangle_orchestrator.py" ]; then
     mkdir -p "$backup_target/runtime"
-    cp "$runtime_target/tangle_orchestrator.py" "$backup_target/runtime/"
+    for runtime_file in tangle_orchestrator.py tangle_mcp_server.py tangle_dashboard.py; do
+      if [ -e "$runtime_target/$runtime_file" ]; then
+        cp "$runtime_target/$runtime_file" "$backup_target/runtime/"
+      fi
+    done
   fi
 fi
 
@@ -61,6 +65,10 @@ for skill in "$source_root"/skills/*; do
 done
 install -m 0755 "$source_root/scripts/tangle_orchestrator.py" \
   "$runtime_target/tangle_orchestrator.py"
+install -m 0755 "$source_root/scripts/tangle_mcp_server.py" \
+  "$runtime_target/tangle_mcp_server.py"
+install -m 0755 "$source_root/scripts/tangle_dashboard.py" \
+  "$runtime_target/tangle_dashboard.py"
 
 if [ ! -e "$target/tangle.json" ]; then
   cp "$source_root/tangle.example.json" "$target/tangle.json"
@@ -71,3 +79,4 @@ if [ -n "$backup_target" ]; then
   echo "Existing Tangle files backed up to $backup_target"
 fi
 echo "Next: python3 .claude/tangle/tangle_orchestrator.py doctor --config tangle.json"
+echo "Dashboard: python3 .claude/tangle/tangle_dashboard.py --repo \"$target\" --open"
