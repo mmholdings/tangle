@@ -10,6 +10,7 @@ import os
 import secrets
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -21,8 +22,9 @@ from pathlib import Path
 from socketserver import TCPServer
 from typing import Any
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 MAX_BODY_BYTES = 16_384
+MAX_COMMAND_OUTPUT_BYTES = 1_000_000
 ALLOWED_ACTIONS = {"poll", "reconcile"}
 
 
@@ -65,20 +67,31 @@ def resolve_repo(candidate: Path) -> Path:
 
 
 def run_tangle(repo: Path, orchestrator: Path, arguments: list[str]) -> dict[str, Any]:
-    try:
-        process = subprocess.run(
-            [sys.executable, str(orchestrator), *arguments],
-            cwd=repo,
-            text=True,
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise DashboardError("Tangle command exceeded 30 seconds") from exc
+    with (
+        tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stdout,
+        tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr,
+    ):
+        try:
+            process = subprocess.run(
+                [sys.executable, str(orchestrator), *arguments],
+                cwd=repo,
+                text=True,
+                stdout=stdout,
+                stderr=stderr,
+                timeout=30,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise DashboardError("Tangle command exceeded 30 seconds") from exc
+        stdout.seek(0)
+        stderr.seek(0)
+        output = stdout.read(MAX_COMMAND_OUTPUT_BYTES + 1)
+        error_output = stderr.read(20_001)
+    if len(output.encode("utf-8")) > MAX_COMMAND_OUTPUT_BYTES:
+        raise DashboardError("Tangle status is too large for the dashboard")
     if process.returncode:
-        raise DashboardError(process.stderr.strip() or process.stdout.strip() or "Tangle command failed")
-    output = process.stdout.strip()
+        raise DashboardError(error_output.strip() or output.strip() or "Tangle command failed")
+    output = output.strip()
     if not output:
         return {"ok": True}
     try:
@@ -175,6 +188,8 @@ function render(state) {{
   q("running").textContent=entries.filter(([,t]) => t.status === "running").length;
   q("review").textContent=entries.filter(([,t]) => t.status === "review").length;
   q("updated").textContent=`Updated ${{new Date().toLocaleTimeString()}}`;
+  const warnings=(state.resources && state.resources.warnings) || [];
+  if(state.storage && !state.storage.available) warnings.unshift(state.storage.reason || "Configured worktree storage is offline.");
   q("rows").replaceChildren();
   q("empty").hidden=entries.length > 0; q("table").hidden=entries.length === 0;
   if(!entries.length) q("empty").textContent="No workers yet. Ask Claude to create a scoped Tangle worker.";
@@ -189,9 +204,10 @@ function render(state) {{
     outcomeCell.append(node("div",outcome,"detail"));
     tr.append(taskCell,statusCell,scopeCell,attemptCell,outcomeCell); q("rows").append(tr);
   }}
+  return [...new Set(warnings)].join(" · ");
 }}
 async function refresh(clearNotice=false) {{
-  try {{ const body=await request("/api/status"); if(!body.initialized) {{ q("empty").textContent=body.error; setNotice("Ask Claude to initialize Tangle in this project.",true); return; }} render(body.state); if(clearNotice) setNotice(""); }}
+  try {{ const body=await request("/api/status"); if(!body.initialized) {{ q("empty").textContent=body.error; setNotice("Ask Claude to initialize Tangle in this project.",true); return; }} const warning=render(body.state); if(warning) setNotice(warning,true); else if(clearNotice) setNotice(""); }}
   catch(error) {{ setNotice(error.message,true); }}
 }}
 async function action(name) {{
@@ -201,7 +217,7 @@ async function action(name) {{
 }}
 q("refresh").addEventListener("click",()=>refresh(true)); q("poll").addEventListener("click",()=>action("poll")); q("reconcile").addEventListener("click",()=>action("reconcile"));
 q("stop").addEventListener("click",async()=>{{ if(!confirm("Stop this local Tangle dashboard?")) return; try {{ await request("/api/shutdown",{{method:"POST",headers:{{"X-Tangle-Token":TOKEN}}}}); document.body.replaceChildren(node("main","Tangle dashboard stopped.")); }} catch(error) {{ setNotice(error.message,true); }} }});
-refresh(true); setInterval(()=>refresh(false),3000);
+refresh(true); setInterval(()=>{{ if(!document.hidden) refresh(false); }},10000);
 </script>
 </body>
 </html>""".encode("utf-8")

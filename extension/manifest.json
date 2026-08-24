@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "tangle",
   "display_name": "Tangle",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Claude-led, Codex-powered local engineering with isolated workers and review-gated integration.",
   "long_description": "Tangle lets Claude Desktop remain the engineering lead while it delegates scoped implementation work to parallel Codex workers. It attaches safely to clean or dirty Git sessions, uses private worktrees, enforces file ownership, and requires Claude review before an accepted delta can be integrated. The runtime and dashboard stay on your computer.",
   "author": {
@@ -46,6 +46,7 @@
     {"name": "tangle_integrate_worker", "description": "Apply only an accepted worker delta."},
     {"name": "tangle_cancel_worker", "description": "Stop or abandon a verified worker process."},
     {"name": "tangle_cleanup_worker", "description": "Clean up a terminal worker worktree."},
+    {"name": "tangle_prune_runtime", "description": "Remove expired artifacts for cleaned terminal workers."},
     {"name": "tangle_open_dashboard", "description": "Open the localhost-only Tangle dashboard."}
   ],
   "tools_generated": false,

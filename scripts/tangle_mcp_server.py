@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -15,7 +16,7 @@ import webbrowser
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 LATEST_PROTOCOL = "2025-11-25"
 SUPPORTED_PROTOCOLS = {
     "2024-11-05",
@@ -24,6 +25,8 @@ SUPPORTED_PROTOCOLS = {
     "2025-11-25",
 }
 MAX_MESSAGE_BYTES = 1_000_000
+MAX_COMMAND_OUTPUT_BYTES = 1_000_000
+MAX_DASHBOARD_LOG_BYTES = 5 * 1024 * 1024
 
 
 def annotations(
@@ -175,6 +178,18 @@ TOOLS: list[dict[str, Any]] = [
         "annotations": annotations(destructive=True, idempotent=True),
     },
     {
+        "name": "tangle_prune_runtime",
+        "title": "Prune Tangle runtime",
+        "description": "Remove expired logs, prompts, and attempt files only for terminal workers whose worktrees have already been cleaned.",
+        "inputSchema": object_schema(
+            {
+                "older_than_days": {"type": "integer", "minimum": 0, "maximum": 3650},
+                "dry_run": {"type": "boolean", "default": False},
+            }
+        ),
+        "annotations": annotations(destructive=True, idempotent=True),
+    },
+    {
         "name": "tangle_open_dashboard",
         "title": "Open local Tangle dashboard",
         "description": "Start or reuse the localhost-only dashboard for this project and open it in the default browser. The dashboard can poll and reconcile but cannot accept or integrate work.",
@@ -239,25 +254,38 @@ class TangleMcpServer:
         return root
 
     def run_tangle(self, arguments: list[str]) -> dict[str, Any]:
-        try:
-            process = subprocess.run(
-                [sys.executable, str(self.orchestrator), *arguments],
-                cwd=self.repo,
-                text=True,
-                capture_output=True,
-                timeout=self.command_timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
+        with (
+            tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stdout,
+            tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr,
+        ):
+            try:
+                process = subprocess.run(
+                    [sys.executable, str(self.orchestrator), *arguments],
+                    cwd=self.repo,
+                    text=True,
+                    stdout=stdout,
+                    stderr=stderr,
+                    timeout=self.command_timeout,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise McpFailure(
+                    f"Tangle command exceeded the {self.command_timeout}-second MCP limit"
+                ) from exc
+            stdout.seek(0)
+            stderr.seek(0)
+            output = stdout.read(MAX_COMMAND_OUTPUT_BYTES + 1)
+            error_output = stderr.read(20_001)
+        if len(output.encode("utf-8")) > MAX_COMMAND_OUTPUT_BYTES:
             raise McpFailure(
-                f"Tangle command exceeded the {self.command_timeout}-second MCP limit"
-            ) from exc
+                "Tangle command output exceeded the MCP safety limit; use the local CLI for full details"
+            )
         if process.returncode:
-            message = process.stderr.strip() or process.stdout.strip() or "Tangle command failed"
+            message = error_output.strip() or output.strip() or "Tangle command failed"
             if len(message) > 20_000:
                 message = message[:20_000] + "\n… output truncated"
             raise McpFailure(message)
-        output = process.stdout.strip()
+        output = output.strip()
         if not output:
             return {"ok": True}
         try:
@@ -369,6 +397,23 @@ class TangleMcpServer:
             if delete:
                 command.append("--delete-branch")
             return self.run_tangle(command)
+        if name == "tangle_prune_runtime":
+            command = ["prune-runtime"]
+            days = supplied.get("older_than_days")
+            if days is not None:
+                if (
+                    not isinstance(days, int)
+                    or isinstance(days, bool)
+                    or not 0 <= days <= 3650
+                ):
+                    raise McpFailure("older_than_days must be an integer between 0 and 3650")
+                command.extend(["--older-than-days", str(days)])
+            dry_run = supplied.get("dry_run", False)
+            if not isinstance(dry_run, bool):
+                raise McpFailure("dry_run must be a boolean")
+            if dry_run:
+                command.append("--dry-run")
+            return self.run_tangle(command)
         if name == "tangle_open_dashboard":
             port = supplied.get("port", 0)
             open_browser = supplied.get("open_browser", True)
@@ -401,6 +446,14 @@ class TangleMcpServer:
 
         logs = runtime / "logs"
         logs.mkdir(parents=True, exist_ok=True)
+        dashboard_log = logs / "dashboard.stderr.log"
+        if (
+            dashboard_log.is_file()
+            and dashboard_log.stat().st_size > MAX_DASHBOARD_LOG_BYTES
+        ):
+            rotated = dashboard_log.with_suffix(".log.1")
+            rotated.unlink(missing_ok=True)
+            os.replace(dashboard_log, rotated)
         command = [
             sys.executable,
             str(self.dashboard),
@@ -415,7 +468,7 @@ class TangleMcpServer:
         ]
         if open_browser:
             command.append("--open")
-        stderr_handle = (logs / "dashboard.stderr.log").open("ab")
+        stderr_handle = dashboard_log.open("ab")
         try:
             subprocess.Popen(
                 command,

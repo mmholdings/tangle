@@ -35,7 +35,7 @@ The MCP adapter runs over the standard stdio transport and negotiates supported 
 
 Each MCP tool maps to a fixed orchestrator argument sequence with explicit type checks, unknown-argument rejection, a message-size limit, and a command timeout. Read-only and destructive annotations are hints for clients, while the orchestrator remains the enforcement boundary. A successful worker process still stops at `review`; acceptance and integration remain separate tools with the same revalidation performed by the CLI.
 
-The MCP Bundle uses the current `manifest_version: 0.3` package format and bundles only standard-library Python files and its local icon. The build is deterministic and its contents are tested.
+The MCP Bundle uses the current `manifest_version: 0.3` package format and bundles only standard-library Python files and its local icon. The build is deterministic and its contents are tested. MCP and dashboard subprocess output is spooled through bounded temporary files rather than accumulated without limit in the host application's memory.
 
 ## Dashboard boundary
 
@@ -56,6 +56,8 @@ Its only orchestration actions are `poll` and `reconcile`. It cannot create, lau
   results/<task-id>.json
   logs/<task-id>-attempt-<n>.*
 ```
+
+With external storage enabled, only `worktrees/` moves to a validated, project-specific directory on the configured volume. The state and lock remain with the project so the control plane can report an offline drive without accidentally recreating its mount path on the internal disk.
 
 Every mutating command holds a stable file lock across state loading, related Git mutations, and atomic state replacement. This prevents concurrent `create-worker`, polling, and review operations from losing updates. `init` is idempotent; an explicit force reset is refused while registered worktrees exist.
 
@@ -93,7 +95,7 @@ A dependency must exist and be accepted or integrated before a downstream worktr
 
 ## Codex adapter
 
-The current adapter launches authenticated Codex CLI sessions asynchronously. Each attempt receives a generated contract containing task scope, owned paths, acceptance criteria, tests, and prohibited behavior. Events, stderr, the final report, process identity, timeout outcome, and Codex thread ID are persisted locally.
+The current adapter launches authenticated Codex CLI sessions asynchronously. Each attempt receives a generated contract containing task scope, owned paths, acceptance criteria, tests, and prohibited behavior. Events, stderr, the final report, process identity, timeout outcome, and Codex thread ID are persisted locally. Event and stderr files are tail-capped after process completion, and worker reports are read and stored through a configurable byte limit.
 
 Polling never trusts a successful process exit by itself. It runs the same branch, ancestry, cleanliness, non-no-op, and ownership validation used for manual completion. Resume reuses the captured Codex thread when available and observes the configured retry bound. Timeout handling and cancellation terminate the Codex process group; cancellation validates a per-launch token and both recorded process identities before signaling.
 
@@ -101,7 +103,7 @@ Polling never trusts a successful process exit by itself. It runs the same branc
 
 Completion produces a compact result record but stops at `review`. Claude inspects the exact base-to-commit diff and runs the applicable project checks before invoking `accept`.
 
-Integration revalidates that the worker has not changed since acceptance. It then applies a binary-capable patch for only `task.base_commit..task.commit` to Claude's invoking branch. The patch is applied without `--index`; Tangle verifies the active index tree is identical before and after. The combined change stays available for Claude to inspect, adjust, stage, and commit normally.
+Integration revalidates that the worker has not changed since acceptance. It then applies a binary-capable patch for only `task.base_commit..task.commit` to Claude's invoking branch. Large dependency and integration patches are streamed to short-lived files beside the worker root instead of being held in Python memory. The patch is applied without `--index`; Tangle verifies the active index tree is identical before and after. The combined change stays available for Claude to inspect, adjust, stage, and commit normally.
 
 This delta approach is essential for mid-session attachment: merging the worker branch would also merge the private snapshot commit and could commit Claude's previously dirty work.
 
@@ -109,7 +111,13 @@ This delta approach is essential for mid-session attachment: merging the worker 
 
 The runtime merges `tangle.json` over explicit defaults and rejects unknown keys, invalid types, unsafe paths, unsupported adapters, excessive worker limits, and dangerous worker sandboxes. `configure` reloads settings without resetting tasks and refuses to move the worktree root while worktrees exist.
 
-Expected failures return concise errors without tracebacks. Cleanup refuses active or dirty worktrees. Branch deletion is separate and allowed only for integrated, canceled, or failed tasks. Reconciliation collects finished jobs, marks missing active worktrees failed, and prunes stale Git worktree metadata.
+External mode requires an absolute mounted-volume path and expected volume name, with an optional UUID for stronger identity. The resolved mount must be a real mount point rather than an ordinary fallback directory. POSIX-incompatible filesystems are rejected. Each repository receives a deterministic project-specific subdirectory beneath the selected external root.
+
+Before worker creation, Tangle verifies free space. Before launch or resume, it also checks available memory and the adaptive concurrent-worker ceiling derived from physical RAM. This ceiling limits active Codex processes, not Claude's own tools or its authority to code directly.
+
+Expected failures return concise errors without tracebacks. Cleanup refuses active or dirty worktrees. Branch deletion is separate and allowed only for integrated, canceled, or failed tasks. Reconciliation collects finished jobs, marks genuinely missing active worktrees failed, and prunes stale Git metadata only while the configured storage is available. If a removable volume is offline or has the wrong identity, reconciliation records the health failure and preserves both task status and worktree registration.
+
+`prune-runtime` removes expired attempt artifacts only for terminal tasks whose worktrees have already been cleaned. It supports a dry run, while compact status views and slower visibility-aware dashboard polling prevent historical reports from being repeatedly copied into Claude Desktop memory.
 
 ## Deployment and trust boundary
 

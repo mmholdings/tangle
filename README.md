@@ -120,19 +120,44 @@ For a dependent task, pass `--depends-on T1`. Tangle starts it only after T1 is 
 | `accept` | Record Claude's review gate |
 | `integrate` | Apply only the reviewed task delta, preserving the index |
 | `cleanup` / `reconcile` | Safely retire tasks or repair stale local metadata |
+| `prune-runtime` | Preview or remove expired attempt artifacts for cleaned terminal tasks |
 | `status` | Print compact persistent task state |
 
 The MCP adapter exposes bounded equivalents of these lifecycle commands plus `tangle_open_dashboard`. It deliberately exposes no generic command runner.
 
 Use `python3 .claude/tangle/tangle_orchestrator.py <command> --help` for command-specific options.
 
+Ordinary `status` output is bounded to current work plus the most recent history so MCP and dashboard responses stay small. Use `status --full` locally when older task records are needed.
+
 ## Configuration
 
 The checked-in [tangle.example.json](tangle.example.json) is the complete schema. Tangle rejects unknown fields, wrong types, unsafe worktree paths, unsupported adapters, and `danger-full-access` workers with concise errors.
 
-The default worker is `gpt-5.6-luna` at `high` reasoning on the fast service tier. Change the Codex worker model in `tangle.json` and run `configure`; this does not change Claude's selected model. Worker attempts default to a 30-minute timeout and one bounded retry.
+The default worker is `gpt-5.6-luna` at `high` reasoning on the fast service tier. Change the Codex worker model in `tangle.json` and run `configure`; this does not change Claude's selected model. Worker attempts default to a 30-minute timeout and one bounded retry. Tangle defaults to two configured workers and automatically lowers actual concurrent launches on smaller-memory computers; an 8 GB Mac runs one Codex worker at a time while Claude remains fully available.
 
 Nonignored untracked files enter dirty-session snapshots by default so workers see what Claude sees. Keep secrets and machine-local files in `.gitignore`, or set `active_session.include_untracked_nonignored` to `false`.
+
+### External storage on Mac
+
+Tangle can place isolated worker checkouts and their build output on a specific removable volume. The volume must already be mounted, have the configured name, match the optional volume UUID, and use a Git-safe filesystem such as APFS or HFS+. Tangle rejects ExFAT, FAT, and NTFS worktree volumes because they do not reliably preserve Unix permissions and symlinks.
+
+For a drive mounted as `/Volumes/STORAGE 1`, set this block in the project's `tangle.json`:
+
+```json
+"storage": {
+  "mode": "external",
+  "external_mount": "/Volumes/STORAGE 1",
+  "external_volume_name": "STORAGE 1",
+  "external_volume_id": "",
+  "external_subdirectory": "Tangle",
+  "minimum_free_gb": 5,
+  "runtime_retention_days": 14
+}
+```
+
+Then run `configure` and `doctor`. Tangle creates a project-specific directory on that volume, so projects cannot collide. Supplying the UUID shown by `diskutil info "/Volumes/STORAGE 1"` provides the strongest identity check.
+
+If the drive disconnects, `status` and the dashboard report it as offline. `reconcile` preserves task state and Git worktree registrations until the same volume returns. Tangle never silently falls back to the internal disk. Essential state stays under the project's `.tangle/`; attempt reports and logs are bounded, and `prune-runtime --dry-run` previews retention cleanup.
 
 ## Where it runs
 
@@ -142,7 +167,7 @@ Runtime state is excluded locally through `.git/info/exclude` during initializat
 
 ## Reliability
 
-The standard-library test suite covers dirty snapshots, ignored secrets, staged and untracked files, concurrent state updates, dependency composition, ownership enforcement, review gates, active-index preservation, installation, Unicode token counting, the asynchronous worker lifecycle, MCP negotiation and tool boundaries, dashboard security, and reproducible MCP Bundle packaging. GitHub Actions runs it on macOS and Linux with Python 3.10 and 3.12.
+The standard-library test suite covers dirty snapshots, ignored secrets, staged and untracked files, concurrent state updates, dependency composition, ownership enforcement, review gates, active-index preservation, external-volume validation and disconnects, resource limits, bounded reports, retention pruning, installation, Unicode token counting, the asynchronous worker lifecycle, MCP negotiation and tool boundaries, dashboard security, and reproducible MCP Bundle packaging. GitHub Actions runs it on macOS and Linux with Python 3.10 and 3.12.
 
 See [the architecture](docs/ARCHITECTURE.md), [delivered buildout](BUILDOUT.md), and [continuation prompt](BUILD_PROMPT.md).
 

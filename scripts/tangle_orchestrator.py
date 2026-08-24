@@ -7,8 +7,11 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
+import platform
+import plistlib
 import re
 import shutil
 import signal
@@ -22,18 +25,29 @@ from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 STATE_VERSION = 2
 ACTIVE_STATUSES = {"ready", "running", "review"}
 TERMINAL_STATUSES = {"integrated", "canceled", "failed"}
 ALLOWED_SANDBOXES = {"read-only", "workspace-write", "danger-full-access"}
 ALLOWED_APPROVAL_POLICIES = {"on-request", "never", "auto-review"}
 ALLOWED_REASONING = {"none", "low", "medium", "high", "xhigh", "max"}
+ALLOWED_STORAGE_MODES = {"project", "external"}
+UNSUITABLE_WORKTREE_FILESYSTEMS = {
+    "exfat",
+    "fuseblk",
+    "msdos",
+    "msdosfs",
+    "ntfs",
+    "vfat",
+}
+STATUS_REPORT_CHARS = 4_000
+MAX_STATUS_TASKS = 100
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "version": 1,
     "execution_policy": "codex-first-hybrid",
-    "max_workers": 4,
+    "max_workers": 2,
     "allow_claude_direct_edits": True,
     "preserve_selected_claude_model": True,
     "active_session": {
@@ -55,6 +69,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_retries": 1,
         "allow_noop": False,
     },
+    "storage": {
+        "mode": "project",
+        "external_mount": "",
+        "external_volume_name": "",
+        "external_volume_id": "",
+        "external_subdirectory": "Tangle",
+        "minimum_free_gb": 5,
+        "runtime_retention_days": 14,
+    },
+    "resources": {
+        "adaptive_worker_limit": True,
+        "minimum_available_memory_percent": 10,
+        "max_worker_report_kb": 64,
+        "max_log_mb": 20,
+    },
     "claude_direct_edit_reasons": [
         "tiny-change",
         "architecture-sensitive",
@@ -70,6 +99,10 @@ class TangleError(RuntimeError):
     """Expected user-facing failure."""
 
 
+class ExternalStorageUnavailable(TangleError):
+    """Configured removable storage is unavailable or unsafe to use."""
+
+
 def now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -79,7 +112,6 @@ def run(
     *,
     cwd: Path,
     env: dict[str, str] | None = None,
-    input_bytes: bytes | None = None,
 ) -> subprocess.CompletedProcess[Any]:
     merged = os.environ.copy()
     if env:
@@ -88,9 +120,8 @@ def run(
         command,
         cwd=cwd,
         env=merged,
-        input=input_bytes,
         capture_output=True,
-        text=input_bytes is None,
+        text=True,
         check=False,
     )
 
@@ -113,9 +144,35 @@ def git_bytes(root: Path, *args: str) -> bytes:
     return proc.stdout
 
 
-def git_apply(
+@contextlib.contextmanager
+def git_patch_file(root: Path, *args: str) -> Iterator[Path]:
+    temporary_parent = root.parent
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=".tangle-patch-", suffix=".diff", dir=temporary_parent
+    )
+    patch = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            process = subprocess.run(
+                ["git", *args],
+                cwd=root,
+                stdout=output,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        if process.returncode:
+            raise TangleError(
+                process.stderr.decode("utf-8", "replace").strip()
+                or f"git {' '.join(args)} failed"
+            )
+        yield patch
+    finally:
+        patch.unlink(missing_ok=True)
+
+
+def git_apply_file(
     root: Path,
-    patch: bytes,
+    patch: Path,
     *,
     check: bool = False,
     index: bool = False,
@@ -128,10 +185,20 @@ def git_apply(
         args.append("--index")
     if reverse:
         args.append("--reverse")
-    proc = run(args, cwd=root, input_bytes=patch)
-    if proc.returncode:
-        stderr = bytes(proc.stderr).decode("utf-8", "replace").strip()
-        raise TangleError(stderr or "worker patch could not be applied")
+    with patch.open("rb") as input_handle:
+        process = subprocess.run(
+            args,
+            cwd=root,
+            stdin=input_handle,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    if process.returncode:
+        raise TangleError(
+            process.stderr.decode("utf-8", "replace").strip()
+            or "worker patch could not be applied"
+        )
 
 
 def repo_root() -> Path:
@@ -210,6 +277,12 @@ def expect_type(value: Any, expected: type, field: str) -> None:
         raise TangleError(f"config field {field} must be an integer")
     if expected is not int and not isinstance(value, expected):
         raise TangleError(f"config field {field} must be {expected.__name__}")
+
+
+def expect_number(value: Any, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TangleError(f"config field {field} must be a number")
+    return float(value)
 
 
 def safe_relative_path(value: str, field: str) -> PurePosixPath:
@@ -304,6 +377,60 @@ def validate_config(supplied: dict[str, Any]) -> dict[str, Any]:
                 f"workers.{field} must be between {minimum} and {maximum}"
             )
     expect_type(workers["allow_noop"], bool, "workers.allow_noop")
+    expect_type(config["storage"], dict, "storage")
+    storage = config["storage"]
+    storage_unknown = sorted(set(storage) - set(DEFAULT_CONFIG["storage"]))
+    if storage_unknown:
+        raise TangleError(f"unknown storage field(s): {', '.join(storage_unknown)}")
+    for field in (
+        "mode",
+        "external_mount",
+        "external_volume_name",
+        "external_volume_id",
+        "external_subdirectory",
+    ):
+        expect_type(storage[field], str, f"storage.{field}")
+    if storage["mode"] not in ALLOWED_STORAGE_MODES:
+        raise TangleError("storage.mode must be project or external")
+    safe_relative_path(
+        storage["external_subdirectory"], "storage.external_subdirectory"
+    )
+    if storage["mode"] == "external":
+        mount = Path(storage["external_mount"]).expanduser()
+        if not mount.is_absolute():
+            raise TangleError(
+                "storage.external_mount must be an absolute mounted-volume path"
+            )
+        if not storage["external_volume_name"].strip():
+            raise TangleError(
+                "storage.external_volume_name is required for external storage"
+            )
+    minimum_free_gb = expect_number(
+        storage["minimum_free_gb"], "storage.minimum_free_gb"
+    )
+    if not 0 <= minimum_free_gb <= 10_000:
+        raise TangleError("storage.minimum_free_gb must be between 0 and 10000")
+    expect_type(storage["runtime_retention_days"], int, "storage.runtime_retention_days")
+    if not 0 <= storage["runtime_retention_days"] <= 3650:
+        raise TangleError("storage.runtime_retention_days must be between 0 and 3650")
+    expect_type(config["resources"], dict, "resources")
+    resources = config["resources"]
+    resource_unknown = sorted(set(resources) - set(DEFAULT_CONFIG["resources"]))
+    if resource_unknown:
+        raise TangleError(f"unknown resources field(s): {', '.join(resource_unknown)}")
+    expect_type(
+        resources["adaptive_worker_limit"], bool, "resources.adaptive_worker_limit"
+    )
+    for field, minimum, maximum in (
+        ("minimum_available_memory_percent", 0, 100),
+        ("max_worker_report_kb", 1, 1024),
+        ("max_log_mb", 1, 1024),
+    ):
+        expect_type(resources[field], int, f"resources.{field}")
+        if not minimum <= resources[field] <= maximum:
+            raise TangleError(
+                f"resources.{field} must be between {minimum} and {maximum}"
+            )
     expect_type(
         config["claude_direct_edit_reasons"], list, "claude_direct_edit_reasons"
     )
@@ -461,18 +588,307 @@ def path_owned(path: str, patterns: list[str]) -> bool:
     return False
 
 
+def volume_metadata(mount: Path) -> dict[str, str | None]:
+    metadata: dict[str, str | None] = {
+        "name": mount.name,
+        "id": None,
+        "filesystem": None,
+    }
+    if platform.system() == "Darwin" and shutil.which("diskutil"):
+        process = subprocess.run(
+            ["diskutil", "info", "-plist", str(mount)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if process.returncode == 0:
+            try:
+                details = plistlib.loads(process.stdout)
+            except plistlib.InvalidFileException:
+                details = {}
+            metadata["name"] = str(details.get("VolumeName") or mount.name)
+            metadata["id"] = str(details.get("VolumeUUID") or "") or None
+            metadata["filesystem"] = str(
+                details.get("FilesystemType")
+                or details.get("FilesystemName")
+                or details.get("VolumeKind")
+                or ""
+            ).lower() or None
+    elif platform.system() == "Linux" and shutil.which("findmnt"):
+        process = subprocess.run(
+            [
+                "findmnt",
+                "--noheadings",
+                "--output",
+                "FSTYPE,UUID",
+                "--target",
+                str(mount),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if process.returncode == 0:
+            parts = process.stdout.strip().split()
+            if parts:
+                metadata["filesystem"] = parts[0].lower()
+            if len(parts) > 1 and parts[1] != "-":
+                metadata["id"] = parts[1]
+    return metadata
+
+
+def repository_storage_key(root: Path) -> str:
+    digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:10]
+    return f"{slug(root.name)}-{digest}"
+
+
+def external_mount(config: dict[str, Any]) -> tuple[Path, dict[str, str | None]]:
+    storage = config["storage"]
+    configured = Path(storage["external_mount"]).expanduser()
+    try:
+        mount = configured.resolve(strict=True)
+    except OSError as exc:
+        raise ExternalStorageUnavailable(
+            f"external storage is offline: {configured}"
+        ) from exc
+    if mount == Path(mount.anchor) or not mount.is_dir() or not os.path.ismount(mount):
+        raise ExternalStorageUnavailable(
+            f"external storage path is not a mounted volume: {mount}"
+        )
+    metadata = volume_metadata(mount)
+    expected_name = storage["external_volume_name"].strip()
+    if metadata["name"] != expected_name:
+        raise ExternalStorageUnavailable(
+            f"mounted volume name is {metadata['name']!r}; expected {expected_name!r}"
+        )
+    expected_id = storage["external_volume_id"].strip()
+    if expected_id and str(metadata["id"] or "").casefold() != expected_id.casefold():
+        actual = metadata["id"] or "unavailable"
+        raise ExternalStorageUnavailable(
+            f"mounted volume identity is {actual!r}; expected {expected_id!r}"
+        )
+    filesystem = str(metadata["filesystem"] or "").lower()
+    if filesystem in UNSUITABLE_WORKTREE_FILESYSTEMS:
+        raise ExternalStorageUnavailable(
+            f"{filesystem} is not safe for Git worktrees; use APFS, HFS+, ext4, or another POSIX filesystem"
+        )
+    return mount, metadata
+
+
+def storage_location_key(config: dict[str, Any]) -> tuple[str, ...]:
+    storage = config["storage"]
+    if storage["mode"] == "project":
+        return ("project", config["workers"]["worktree_root"])
+    return (
+        "external",
+        storage["external_mount"],
+        storage["external_volume_name"],
+        storage["external_volume_id"],
+        storage["external_subdirectory"],
+        config["workers"]["worktree_root"],
+    )
+
+
 def worktree_root(root: Path, config: dict[str, Any]) -> Path:
-    target = (
-        root
-        / safe_relative_path(
-            config["workers"]["worktree_root"], "workers.worktree_root"
-        )
-    ).resolve()
-    if target == root or root not in target.parents:
-        raise TangleError(
-            "workers.worktree_root must resolve to a directory inside the repository"
-        )
+    relative = safe_relative_path(
+        config["workers"]["worktree_root"], "workers.worktree_root"
+    )
+    if config["storage"]["mode"] == "project":
+        target = (root / relative).resolve()
+        if target == root or root not in target.parents:
+            raise TangleError(
+                "workers.worktree_root must resolve to a directory inside the repository"
+            )
+        return target
+    mount, _ = external_mount(config)
+    subdirectory = safe_relative_path(
+        config["storage"]["external_subdirectory"],
+        "storage.external_subdirectory",
+    )
+    target = (mount / subdirectory / repository_storage_key(root) / relative).resolve()
+    if target == mount or mount not in target.parents:
+        raise TangleError("external worktree root escaped its configured volume")
     return target
+
+
+def nearest_existing(path: Path) -> Path:
+    current = path
+    while not current.exists() and current != current.parent:
+        current = current.parent
+    return current
+
+
+def physical_memory_bytes() -> int | None:
+    try:
+        pages = int(os.sysconf("SC_PHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    total = pages * page_size
+    return total if total > 0 else None
+
+
+def available_memory_percent() -> int | None:
+    if platform.system() == "Darwin" and shutil.which("memory_pressure"):
+        process = subprocess.run(
+            ["memory_pressure", "-Q"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        match = re.search(
+            r"System-wide memory free percentage:\s*(\d+)%", process.stdout
+        )
+        if process.returncode == 0 and match:
+            return int(match.group(1))
+    meminfo = Path("/proc/meminfo")
+    if meminfo.is_file():
+        values: dict[str, int] = {}
+        try:
+            for line in meminfo.read_text(encoding="utf-8").splitlines():
+                key, value = line.split(":", 1)
+                values[key] = int(value.strip().split()[0])
+        except (OSError, ValueError, IndexError):
+            return None
+        total = values.get("MemTotal", 0)
+        available = values.get("MemAvailable", 0)
+        if total and available:
+            return round(available * 100 / total)
+    return None
+
+
+def memory_worker_limit(total_bytes: int | None) -> int | None:
+    if total_bytes is None:
+        return None
+    gib = total_bytes / (1024**3)
+    if gib < 12:
+        return 1
+    if gib < 24:
+        return 2
+    if gib < 48:
+        return 3
+    return 4
+
+
+def storage_health(root: Path, config: dict[str, Any]) -> dict[str, Any]:
+    storage = config["storage"]
+    try:
+        target = worktree_root(root, config)
+        usage = shutil.disk_usage(nearest_existing(target))
+        free_gb = round(usage.free / (1024**3), 1)
+        metadata: dict[str, str | None] = {
+            "name": None,
+            "id": None,
+            "filesystem": None,
+        }
+        mount_path: str | None = None
+        if storage["mode"] == "external":
+            mount, metadata = external_mount(config)
+            mount_path = str(mount)
+        return {
+            "available": True,
+            "mode": storage["mode"],
+            "worktree_root": str(target),
+            "mount": mount_path,
+            "volume_name": metadata["name"],
+            "volume_id": metadata["id"],
+            "filesystem": metadata["filesystem"],
+            "free_gb": free_gb,
+            "minimum_free_gb": storage["minimum_free_gb"],
+        }
+    except (ExternalStorageUnavailable, OSError) as exc:
+        return {
+            "available": False,
+            "mode": storage["mode"],
+            "mount": storage["external_mount"] or None,
+            "reason": str(exc),
+            "minimum_free_gb": storage["minimum_free_gb"],
+        }
+
+
+def resource_status(
+    root: Path,
+    config: dict[str, Any],
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    total = physical_memory_bytes()
+    available = available_memory_percent()
+    configured = config["max_workers"]
+    memory_limit = memory_worker_limit(total)
+    effective = configured
+    if config["resources"]["adaptive_worker_limit"] and memory_limit is not None:
+        effective = min(effective, memory_limit)
+    running = 0
+    if state:
+        running = sum(
+            task.get("status") == "running" for task in state["tasks"].values()
+        )
+    storage = storage_health(root, config)
+    warnings: list[str] = []
+    blocked = False
+    if not storage["available"]:
+        warnings.append(str(storage.get("reason", "worktree storage is unavailable")))
+        blocked = True
+    elif float(storage["free_gb"]) < float(storage["minimum_free_gb"]):
+        warnings.append(
+            f"only {storage['free_gb']} GB is free at the worktree location"
+        )
+        blocked = True
+    elif float(storage["free_gb"]) < 10:
+        warnings.append(
+            f"worktree storage is low ({storage['free_gb']} GB free); external storage is recommended"
+        )
+    minimum_memory = config["resources"]["minimum_available_memory_percent"]
+    if available is not None and available < minimum_memory:
+        warnings.append(f"available memory is {available}%")
+        blocked = True
+    if effective < configured:
+        warnings.append(
+            f"Codex concurrency is reduced from {configured} to {effective} for this computer"
+        )
+    return {
+        "configured_worker_limit": configured,
+        "effective_worker_limit": effective,
+        "running_workers": running,
+        "physical_memory_gb": round(total / (1024**3), 1) if total else None,
+        "available_memory_percent": available,
+        "minimum_available_memory_percent": minimum_memory,
+        "storage": storage,
+        "blocked": blocked,
+        "warnings": warnings,
+    }
+
+
+def require_resources(
+    root: Path,
+    state: dict[str, Any],
+    *,
+    launching: bool,
+) -> dict[str, Any]:
+    status = resource_status(root, state["config"], state)
+    storage = status["storage"]
+    if not storage["available"]:
+        raise ExternalStorageUnavailable(str(storage["reason"]))
+    if float(storage["free_gb"]) < float(storage["minimum_free_gb"]):
+        raise TangleError(
+            f"low disk space: {storage['free_gb']} GB free; "
+            f"Tangle requires {storage['minimum_free_gb']} GB"
+        )
+    if launching:
+        available = status["available_memory_percent"]
+        minimum = status["minimum_available_memory_percent"]
+        if available is not None and available < minimum:
+            raise TangleError(
+                f"low memory: {available}% available; Tangle requires {minimum}%"
+            )
+        if status["running_workers"] >= status["effective_worker_limit"]:
+            raise TangleError(
+                "adaptive worker limit reached "
+                f"({status['effective_worker_limit']} for this computer)"
+            )
+    return status
 
 
 def worktree_is_registered(root: Path, worktree: Path) -> bool:
@@ -604,6 +1020,93 @@ def validate_task_result(
     return commit, files
 
 
+def truncate_text(value: str, limit_bytes: int) -> str:
+    encoded = value.encode("utf-8", "replace")
+    if len(encoded) <= limit_bytes:
+        return value
+    marker = "\n… report truncated by Tangle"
+    room = max(0, limit_bytes - len(marker.encode("utf-8")))
+    return encoded[:room].decode("utf-8", "ignore").rstrip() + marker
+
+
+def read_text_limited(path: Path, limit_bytes: int) -> str:
+    with path.open("rb") as handle:
+        raw = handle.read(limit_bytes + 1)
+    text = raw[:limit_bytes].decode("utf-8", "replace").strip()
+    if len(raw) > limit_bytes:
+        text = truncate_text(text + "\n…", limit_bytes)
+    return text
+
+
+def task_view(
+    task: dict[str, Any], *, report_chars: int = STATUS_REPORT_CHARS
+) -> dict[str, Any]:
+    fields = (
+        "title",
+        "status",
+        "branch",
+        "worktree",
+        "owns",
+        "depends_on",
+        "attempts",
+        "changed_files",
+        "tests",
+        "unresolved",
+        "last_error",
+        "session_id",
+        "created_at",
+        "started_at",
+        "finished_at",
+        "completed_at",
+        "accepted_at",
+        "integrated_at",
+        "cleaned_at",
+    )
+    result = {field: task[field] for field in fields if field in task}
+    for field in ("tests", "last_error"):
+        if isinstance(result.get(field), str) and len(result[field]) > report_chars:
+            result[field] = result[field][:report_chars].rstrip() + "\n… truncated"
+    return result
+
+
+def status_payload(
+    root: Path, state: dict[str, Any], *, full: bool = False
+) -> dict[str, Any]:
+    resources = resource_status(root, state["config"], state)
+    current = sorted(
+        (
+            item
+            for item in state["tasks"].items()
+            if item[1].get("status") not in TERMINAL_STATUSES
+        ),
+        key=lambda item: item[0],
+    )
+    historical = sorted(
+        (
+            item
+            for item in state["tasks"].items()
+            if item[1].get("status") in TERMINAL_STATUSES
+        ),
+        key=lambda item: (str(item[1].get("created_at", "")), item[0]),
+        reverse=True,
+    )
+    items = current + historical
+    omitted = 0
+    if not full and len(items) > MAX_STATUS_TASKS:
+        omitted = len(items) - MAX_STATUS_TASKS
+        items = items[:MAX_STATUS_TASKS]
+    return {
+        "branch": state["invoking_branch"],
+        "base": state["base_commit"],
+        "snapshot": state.get("snapshot_commit"),
+        "storage": resources["storage"],
+        "resources": {key: value for key, value in resources.items() if key != "storage"},
+        "task_count": len(state["tasks"]),
+        "omitted_tasks": omitted,
+        "tasks": {key: task_view(task) for key, task in items},
+    }
+
+
 def write_task_result(root: Path, task_key: str, task: dict[str, Any]) -> None:
     atomic_json(
         state_paths(root)["results"] / f"{task_key}.json",
@@ -634,7 +1137,7 @@ def cmd_init(args: argparse.Namespace) -> None:
             live = [
                 key
                 for key, task in existing["tasks"].items()
-                if task.get("worktree") and Path(task["worktree"]).exists()
+                if task.get("worktree")
             ]
             if live:
                 raise TangleError(
@@ -674,15 +1177,10 @@ def cmd_configure(args: argparse.Namespace) -> None:
     config, source = load_config(root, args.config)
     with state_lock(root):
         state = load_state(root)
-        old_root = worktree_root(root, state["config"])
-        new_root = worktree_root(root, config)
-        live = any(
-            task.get("worktree") and Path(task["worktree"]).exists()
-            for task in state["tasks"].values()
-        )
-        if live and old_root != new_root:
+        live = any(task.get("worktree") for task in state["tasks"].values())
+        if live and storage_location_key(state["config"]) != storage_location_key(config):
             raise TangleError(
-                "cannot change workers.worktree_root while task worktrees exist"
+                "cannot change worktree storage while task worktrees exist"
             )
         state["config"] = config
         state["config_source"] = source
@@ -708,18 +1206,6 @@ def cmd_snapshot(args: argparse.Namespace) -> None:
         print(commit)
 
 
-def dependency_patch(worktree: Path, dependency: dict[str, Any]) -> bytes:
-    return git_bytes(
-        worktree,
-        "diff",
-        "--binary",
-        "--full-index",
-        "--no-renames",
-        dependency["base_commit"],
-        dependency["commit"],
-    )
-
-
 def compose_dependencies(
     worktree: Path, dependencies: list[tuple[str, dict[str, Any]]]
 ) -> None:
@@ -730,12 +1216,20 @@ def compose_dependencies(
         "GIT_COMMITTER_EMAIL": "tangle-orchestrator@local",
     }
     for key, dependency in dependencies:
-        patch = dependency_patch(worktree, dependency)
-        if not patch:
-            continue
-        git_apply(worktree, patch, check=True, index=True)
-        git_apply(worktree, patch, index=True)
-        git(worktree, "commit", "-m", f"Tangle dependency base: {key}", env=env)
+        with git_patch_file(
+            worktree,
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-renames",
+            dependency["base_commit"],
+            dependency["commit"],
+        ) as patch:
+            if patch.stat().st_size == 0:
+                continue
+            git_apply_file(worktree, patch, check=True, index=True)
+            git_apply_file(worktree, patch, index=True)
+            git(worktree, "commit", "-m", f"Tangle dependency base: {key}", env=env)
 
 
 def cmd_create_worker(args: argparse.Namespace) -> None:
@@ -755,6 +1249,7 @@ def cmd_create_worker(args: argparse.Namespace) -> None:
         )
         if active >= max_workers:
             raise TangleError(f"max_workers limit reached ({max_workers})")
+        require_resources(root, state, launching=False)
         dependency_tasks: list[tuple[str, dict[str, Any]]] = []
         for dependency_key in dependencies:
             dependency = state["tasks"].get(dependency_key)
@@ -836,12 +1331,13 @@ def finish_task(
             f"task {key} cannot complete from status {task.get('status')}"
         )
     commit, files = validate_task_result(root, task, allow_noop=allow_noop)
+    report_limit = state["config"]["resources"]["max_worker_report_kb"] * 1024
     task.update(
         {
             "commit": commit,
             "changed_files": files,
             "status": "review",
-            "tests": tests,
+            "tests": truncate_text(tests, report_limit),
             "unresolved": unresolved,
             "completed_at": now(),
             "last_error": None,
@@ -929,7 +1425,9 @@ def cmd_integrate(args: argparse.Namespace) -> None:
         if commit != task.get("commit") or files != task.get("changed_files"):
             raise TangleError("worker changed after acceptance")
         worker_tree = Path(task["worktree"])
-        patch = git_bytes(
+        index_before = git(root, "write-tree")
+        already_applied = False
+        with git_patch_file(
             worker_tree,
             "diff",
             "--binary",
@@ -937,20 +1435,18 @@ def cmd_integrate(args: argparse.Namespace) -> None:
             "--no-renames",
             task["base_commit"],
             task["commit"],
-        )
-        index_before = git(root, "write-tree")
-        already_applied = False
-        if patch:
-            try:
-                git_apply(root, patch, check=True)
-            except TangleError as original_error:
+        ) as patch:
+            if patch.stat().st_size:
                 try:
-                    git_apply(root, patch, check=True, reverse=True)
-                except TangleError:
-                    raise original_error
-                already_applied = True
-            if not already_applied:
-                git_apply(root, patch)
+                    git_apply_file(root, patch, check=True)
+                except TangleError as original_error:
+                    try:
+                        git_apply_file(root, patch, check=True, reverse=True)
+                    except TangleError:
+                        raise original_error
+                    already_applied = True
+                if not already_applied:
+                    git_apply_file(root, patch)
         index_after = git(root, "write-tree")
         if index_before != index_after:
             raise TangleError("integration unexpectedly changed the active Git index")
@@ -1071,6 +1567,22 @@ def parse_thread_id(events: Path) -> str | None:
     return None
 
 
+def trim_file_tail(path: Path, limit_bytes: int) -> bool:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size <= limit_bytes:
+        return False
+    marker = b"Tangle retained only the tail of this oversized log.\n"
+    keep = max(0, limit_bytes - len(marker))
+    with path.open("rb") as source:
+        source.seek(-keep, os.SEEK_END)
+        tail = source.read()
+    with path.open("wb") as target:
+        target.write(marker)
+        target.write(tail)
+    return True
 def launch_attempt(
     root: Path,
     state: dict[str, Any],
@@ -1109,6 +1621,9 @@ def launch_attempt(
             "outcome": str(outcome),
             "runtime": str(runtime),
             "timeout_seconds": workers["timeout_seconds"],
+            "max_log_bytes": (
+                state["config"]["resources"]["max_log_mb"] * 1024 * 1024
+            ),
         },
     )
     process = subprocess.Popen(
@@ -1158,6 +1673,7 @@ def cmd_launch(args: argparse.Namespace) -> None:
             raise TangleError(f"unknown task: {key}")
         if task.get("status") != "ready":
             raise TangleError(f"task {key} must be ready before launch")
+        require_resources(root, state, launching=True)
         task = launch_attempt(root, state, key, mode="new", feedback=feedback)
         save_state(root, state)
         print(
@@ -1213,9 +1729,10 @@ def poll_one(root: Path, state: dict[str, Any], key: str) -> bool:
             result_text = "not reported"
             result_path = Path(task["worker_result"])
             if result_path.exists():
-                result_text = result_path.read_text(
-                    encoding="utf-8", errors="replace"
-                ).strip()
+                report_limit = (
+                    state["config"]["resources"]["max_worker_report_kb"] * 1024
+                )
+                result_text = read_text_limited(result_path, report_limit)
             try:
                 finish_task(
                     root,
@@ -1237,6 +1754,11 @@ def cmd_poll(args: argparse.Namespace) -> None:
     selected = task_id(args.task_id) if args.task_id else None
     with state_lock(root):
         state = load_state(root)
+        storage = storage_health(root, state["config"])
+        if not storage["available"]:
+            raise ExternalStorageUnavailable(
+                f"worker polling is paused: {storage['reason']}"
+            )
         if selected and selected not in state["tasks"]:
             raise TangleError(f"unknown task: {selected}")
         keys = [selected] if selected else sorted(state["tasks"])
@@ -1245,11 +1767,12 @@ def cmd_poll(args: argparse.Namespace) -> None:
             changed = poll_one(root, state, key) or changed
         if changed:
             save_state(root, state)
-        print(
-            json.dumps(
-                {key: state["tasks"][key] for key in keys}, indent=2, sort_keys=True
-            )
+        payload = (
+            {selected: task_view(state["tasks"][selected])}
+            if selected
+            else status_payload(root, state)
         )
+        print(json.dumps(payload, indent=2, sort_keys=True))
 
 
 def cmd_resume(args: argparse.Namespace) -> None:
@@ -1262,6 +1785,7 @@ def cmd_resume(args: argparse.Namespace) -> None:
             raise TangleError(f"unknown task: {key}")
         if task.get("status") not in {"failed", "review"}:
             raise TangleError(f"task {key} must be failed or in review before resume")
+        require_resources(root, state, launching=True)
         mode = "resume" if task.get("session_id") else "new"
         task = launch_attempt(root, state, key, mode=mode, feedback=args.feedback)
         save_state(root, state)
@@ -1303,6 +1827,11 @@ def cmd_cancel(args: argparse.Namespace) -> None:
         if task.get("status") == "running":
             outcome_path = Path(task.get("outcome", ""))
             if outcome_path.is_file():
+                storage = storage_health(root, state["config"])
+                if not storage["available"]:
+                    raise ExternalStorageUnavailable(
+                        f"worker completion is paused: {storage['reason']}"
+                    )
                 poll_one(root, state, key)
                 save_state(root, state)
                 raise TangleError(
@@ -1332,6 +1861,62 @@ def cmd_cancel(args: argparse.Namespace) -> None:
         save_state(root, state)
         write_task_result(root, key, task)
         print(key)
+
+
+def runtime_artifacts(root: Path, state: dict[str, Any]) -> list[Path]:
+    locations = state_paths(root)
+    artifacts: list[Path] = []
+    for key, task in state["tasks"].items():
+        if task.get("status") not in TERMINAL_STATUSES or task.get("worktree"):
+            continue
+        for directory in (
+            locations["jobs"],
+            locations["prompts"],
+            locations["logs"],
+            locations["results"],
+        ):
+            artifacts.extend(directory.glob(f"{key}-attempt-*"))
+    return sorted({path for path in artifacts if path.is_file()})
+
+
+def prune_runtime_files(
+    root: Path,
+    state: dict[str, Any],
+    *,
+    older_than_days: int,
+    dry_run: bool,
+) -> dict[str, Any]:
+    cutoff = time.time() - older_than_days * 86400
+    selected = [
+        path for path in runtime_artifacts(root, state) if path.stat().st_mtime <= cutoff
+    ]
+    reclaimed = sum(path.stat().st_size for path in selected)
+    if not dry_run:
+        for path in selected:
+            path.unlink(missing_ok=True)
+    return {
+        "dry_run": dry_run,
+        "older_than_days": older_than_days,
+        "files": len(selected),
+        "bytes": reclaimed,
+    }
+
+
+def cmd_prune_runtime(args: argparse.Namespace) -> None:
+    root = repo_root()
+    with state_lock(root):
+        state = load_state(root)
+        days = (
+            state["config"]["storage"]["runtime_retention_days"]
+            if args.older_than_days is None
+            else args.older_than_days
+        )
+        if not 0 <= days <= 3650:
+            raise TangleError("--older-than-days must be between 0 and 3650")
+        result = prune_runtime_files(
+            root, state, older_than_days=days, dry_run=args.dry_run
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
 
 
 def cmd_cleanup(args: argparse.Namespace) -> None:
@@ -1383,6 +1968,12 @@ def cmd_reconcile(_: argparse.Namespace) -> None:
     root = repo_root()
     with state_lock(root):
         state = load_state(root)
+        storage = storage_health(root, state["config"])
+        state["storage_health"] = storage | {"checked_at": now()}
+        if not storage["available"]:
+            save_state(root, state)
+            print(json.dumps(status_payload(root, state), indent=2, sort_keys=True))
+            return
         changed = False
         for key in sorted(state["tasks"]):
             changed = poll_one(root, state, key) or changed
@@ -1397,25 +1988,18 @@ def cmd_reconcile(_: argparse.Namespace) -> None:
                 task["last_error"] = "registered worktree is missing"
                 changed = True
         git(root, "worktree", "prune")
-        if changed:
+        if changed or state.get("storage_health") != storage:
             save_state(root, state)
-        print(json.dumps(state["tasks"], indent=2, sort_keys=True))
+        print(json.dumps(status_payload(root, state), indent=2, sort_keys=True))
 
 
-def cmd_status(_: argparse.Namespace) -> None:
+def cmd_status(args: argparse.Namespace) -> None:
     root = repo_root()
     with state_lock(root, shared=True):
         state = load_state(root)
         print(
             json.dumps(
-                {
-                    "branch": state["invoking_branch"],
-                    "base": state["base_commit"],
-                    "snapshot": state.get("snapshot_commit"),
-                    "tasks": state["tasks"],
-                },
-                indent=2,
-                sort_keys=True,
+                status_payload(root, state, full=args.full), indent=2, sort_keys=True
             )
         )
 
@@ -1443,7 +2027,9 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         raise TangleError(proc.stderr.strip() or "Codex CLI version check failed")
     checks["codex"] = proc.stdout.strip()
     checks["config"] = "valid"
-    checks["ready"] = True
+    resources = resource_status(root, config)
+    checks["resources"] = resources
+    checks["ready"] = not resources["blocked"]
     print(json.dumps(checks, indent=2))
 
 
@@ -1509,13 +2095,17 @@ def internal_run_job(job_path: Path) -> int:
                     pass
                 process.wait()
             returncode = 124
+    session_id = parse_thread_id(events)
+    max_log_bytes = int(job.get("max_log_bytes", 20 * 1024 * 1024))
+    trim_file_tail(events, max_log_bytes)
+    trim_file_tail(stderr, max_log_bytes)
     atomic_json(
         outcome,
         {
             "token": token,
             "returncode": returncode,
             "timed_out": timed_out,
-            "session_id": parse_thread_id(events),
+            "session_id": session_id,
             "started_at": started,
             "finished_at": now(),
         },
@@ -1594,11 +2184,20 @@ def parser() -> argparse.ArgumentParser:
     cleanup.add_argument("task_id")
     cleanup.add_argument("--delete-branch", action="store_true")
     cleanup.set_defaults(func=cmd_cleanup)
+    prune = sub.add_parser(
+        "prune-runtime", help="remove expired artifacts for cleaned terminal tasks"
+    )
+    prune.add_argument("--older-than-days", type=int)
+    prune.add_argument("--dry-run", action="store_true")
+    prune.set_defaults(func=cmd_prune_runtime)
     reconcile = sub.add_parser(
         "reconcile", help="repair stale worker status and Git metadata"
     )
     reconcile.set_defaults(func=cmd_reconcile)
     status = sub.add_parser("status", help="show orchestration state")
+    status.add_argument(
+        "--full", action="store_true", help="include all historical tasks"
+    )
     status.set_defaults(func=cmd_status)
     doctor = sub.add_parser(
         "doctor", help="check local prerequisites and configuration"

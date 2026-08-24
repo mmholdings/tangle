@@ -21,6 +21,8 @@ python3 "$TANGLE" doctor --config tangle.json
 python3 "$TANGLE" init --config tangle.json
 ```
 
+Read the doctor's `resources` result before launching workers. Respect the effective worker limit even when the configured limit is higher. If configured external storage is offline, has the wrong volume name or identity, or uses an unsuitable filesystem, pause orchestration and reconnect the intended volume. Do not replace it with a symlink or an unmounted directory under `/Volumes` or `/mnt`.
+
 When Tangle MCP tools are connected, prefer their equivalent fixed-project operations for status and lifecycle actions. The CLI remains the fallback and the enforcement behavior is identical. Never substitute an arbitrary shell or file tool for a Tangle review-gated operation merely because MCP is unavailable.
 
 If the tree is dirty, run `snapshot --label active-session`. The helper must preserve the branch, HEAD, files, and real index. Never use stash, reset, clean, checkout, or a temporary commit on the user's branch.
@@ -64,8 +66,8 @@ Integrate dependencies first, then run `integrate TASK`. The helper revalidates 
 
 Run the full applicable project gate and an independent Codex code review after all accepted deltas are integrated. Address findings before `/tangle-3-release`.
 
-Use `cleanup TASK --delete-branch` only after the result is integrated or deliberately abandoned. Do not push, tag, publish, or delete unrelated refs without the release workflow's authorization.
+Use `cleanup TASK --delete-branch` only after the result is integrated or deliberately abandoned. Use `prune-runtime --dry-run` before removing expired attempt artifacts when disk space is constrained; pruning is limited to cleaned terminal tasks. Do not push, tag, publish, or delete unrelated refs without the release workflow's authorization.
 
 ## Safety
 
-Treat `.tangle/` as local runtime state. Nonignored untracked files enter snapshots by default, so secrets belong in `.gitignore`. Do not use `danger-full-access` for workers, bypass the `review` → `accepted` gate, or merge worker branches that descend from a dirty-session snapshot.
+Treat `.tangle/` as local runtime state. Nonignored untracked files enter snapshots by default, so secrets and large generated assets belong in `.gitignore`. For removable storage, use Tangle's explicit `storage.mode: external` configuration; it binds worktrees to a mounted volume name and optional UUID while leaving essential state with the project. If that volume disconnects, do not prune or recreate worktrees—reconnect it and run `reconcile`. Do not use `danger-full-access` for workers, bypass the `review` → `accepted` gate, or merge worker branches that descend from a dirty-session snapshot.

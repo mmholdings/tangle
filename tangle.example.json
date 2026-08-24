@@ -1,7 +1,7 @@
 {
   "version": 1,
   "execution_policy": "codex-first-hybrid",
-  "max_workers": 4,
+  "max_workers": 2,
   "allow_claude_direct_edits": true,
   "preserve_selected_claude_model": true,
   "active_session": {
@@ -22,6 +22,21 @@
     "timeout_seconds": 1800,
     "max_retries": 1,
     "allow_noop": false
+  },
+  "storage": {
+    "mode": "project",
+    "external_mount": "",
+    "external_volume_name": "",
+    "external_volume_id": "",
+    "external_subdirectory": "Tangle",
+    "minimum_free_gb": 5,
+    "runtime_retention_days": 14
+  },
+  "resources": {
+    "adaptive_worker_limit": true,
+    "minimum_available_memory_percent": 10,
+    "max_worker_report_kb": 64,
+    "max_log_mb": 20
   },
   "claude_direct_edit_reasons": [
     "tiny-change",

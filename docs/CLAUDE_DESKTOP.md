@@ -23,6 +23,17 @@ python3 .claude/tangle/tangle_orchestrator.py doctor --config tangle.json
 
 This adds the Tangle skills and all three local runtime files to that project without overwriting its `tangle.json` on future forced updates.
 
+On a low-memory Mac, leave `resources.adaptive_worker_limit` enabled. Tangle may reduce simultaneous Codex launches below `max_workers`; this does not change Claude's selected model or prevent Claude from coding directly.
+
+To place worker checkouts on an external Mac volume, configure the project's `storage` block before initialization. Use a Mac-native filesystem such as APFS or HFS+, the exact `/Volumes/...` mount path and volume name, and optionally the UUID reported by `diskutil info`. Do not select an ExFAT drive for code worktrees. After editing `tangle.json`, run:
+
+```bash
+python3 .claude/tangle/tangle_orchestrator.py configure --config tangle.json
+python3 .claude/tangle/tangle_orchestrator.py doctor --config tangle.json
+```
+
+If worktrees already exist, finish and clean them before changing storage. If a configured drive disconnects, reconnect the same drive and run `reconcile`; Tangle preserves its task records and does not fall back to the internal disk.
+
 ## Install in Claude Desktop
 
 From the Tangle source repository:
@@ -92,3 +103,6 @@ Reinstall the new `dist/tangle.mcpb` in Claude Desktop. The forced project insta
 - **Codex not found:** run `codex --version` or install/authenticate Codex CLI; on macOS Tangle also checks ChatGPT's bundled Codex executable.
 - **Project rejected:** choose the Git top-level folder, not a subfolder. Tangle intentionally refuses broader or ambiguous access.
 - **Dashboard did not open:** run the direct dashboard command and use the printed local URL. Logs from MCP-launched dashboards are under `.tangle/logs/dashboard.stderr.log`.
+- **External storage offline:** reconnect the configured volume at the same mount path. Confirm its name and optional UUID in `tangle.json`, then run `doctor` and `reconcile`.
+- **External filesystem rejected:** use APFS or HFS+ for Git worktrees. ExFAT remains suitable for large media archives, but not Tangle's checked-out code.
+- **Low memory or disk warning:** close unused heavy applications, reduce `max_workers`, move worktrees to a supported external volume, or prune expired artifacts with `prune-runtime --dry-run` followed by `prune-runtime`.

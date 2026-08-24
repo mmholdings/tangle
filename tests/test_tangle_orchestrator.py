@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -72,11 +74,18 @@ class RepoCase(unittest.TestCase):
         config = json.loads(
             (PROJECT_ROOT / "tangle.example.json").read_text(encoding="utf-8")
         )
+        # Behavioral tests should not depend on transient CI host pressure.
+        config["storage"]["minimum_free_gb"] = 0
+        config["resources"]["minimum_available_memory_percent"] = 0
         for key, value in overrides.items():
             if key.startswith("workers__"):
                 config["workers"][key.split("__", 1)[1]] = value
             elif key.startswith("active_session__"):
                 config["active_session"][key.split("__", 1)[1]] = value
+            elif key.startswith("storage__"):
+                config["storage"][key.split("__", 1)[1]] = value
+            elif key.startswith("resources__"):
+                config["resources"][key.split("__", 1)[1]] = value
             else:
                 config[key] = value
         path = self.root / "tangle.json"
@@ -198,6 +207,13 @@ class StateAndValidationTests(RepoCase):
         self.assertIn("max_workers must be an integer", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_pre_v04_configs_receive_safe_resource_defaults(self) -> None:
+        (self.root / "tangle.json").write_text('{"version": 1}\n', encoding="utf-8")
+        result = json.loads(self.cli("validate-config").stdout)
+        self.assertEqual("project", result["config"]["storage"]["mode"])
+        self.assertTrue(result["config"]["resources"]["adaptive_worker_limit"])
+        self.assertEqual(2, result["config"]["max_workers"])
+
     def test_configure_reloads_settings_without_resetting_tasks(self) -> None:
         self.config()
         self.cli("init")
@@ -211,6 +227,20 @@ class StateAndValidationTests(RepoCase):
         moved = self.cli("configure", check=False)
         self.assertEqual(2, moved.returncode)
         self.assertIn("while task worktrees exist", moved.stderr)
+
+    def test_missing_worktree_cannot_be_erased_by_reconfigure_or_force_init(self) -> None:
+        self.config()
+        self.cli("init")
+        self.cli("create-worker", "T1", "--title", "one", "--owns", "src/**")
+        target = Path(self.state()["tasks"]["T1"]["worktree"])
+        self.git("worktree", "remove", "--force", str(target))
+        self.config(workers__worktree_root="moved-workers")
+        configured = self.cli("configure", check=False)
+        self.assertEqual(2, configured.returncode)
+        self.assertIn("while task worktrees exist", configured.stderr)
+        forced = self.cli("init", "--force", check=False)
+        self.assertEqual(2, forced.returncode)
+        self.assertIn("task worktrees exist", forced.stderr)
 
     def test_dependencies_and_active_ownership_are_enforced(self) -> None:
         self.config()
@@ -255,6 +285,77 @@ class StateAndValidationTests(RepoCase):
         result = self.cli("init", check=False)
         self.assertEqual(2, result.returncode)
         self.assertIn("inside the repository", result.stderr)
+
+    def test_external_storage_configuration_requires_an_explicit_volume(self) -> None:
+        self.config(storage__mode="external", storage__external_mount="relative")
+        result = self.cli("validate-config", check=False)
+        self.assertEqual(2, result.returncode)
+        self.assertIn("absolute mounted-volume path", result.stderr)
+
+    def test_external_worktree_root_is_mount_checked_and_project_specific(self) -> None:
+        specification = importlib.util.spec_from_file_location(
+            "tangle_orchestrator_storage_test", ORCHESTRATOR
+        )
+        assert specification and specification.loader
+        module = importlib.util.module_from_spec(specification)
+        specification.loader.exec_module(module)
+        mount = Path(self.temporary.name) / "STORAGE 1"
+        mount.mkdir()
+        config = module.validate_config(
+            {
+                "storage": {
+                    "mode": "external",
+                    "external_mount": str(mount),
+                    "external_volume_name": "STORAGE 1",
+                    "external_volume_id": "volume-1",
+                }
+            }
+        )
+        metadata = {"name": "STORAGE 1", "id": "volume-1", "filesystem": "hfs"}
+        with mock.patch.object(module.os.path, "ismount", return_value=True), mock.patch.object(
+            module, "volume_metadata", return_value=metadata
+        ):
+            selected = module.worktree_root(self.root, config)
+        self.assertTrue(selected.is_relative_to(mount.resolve()))
+        self.assertIn("Tangle", selected.parts)
+        self.assertIn(self.root.name, selected.parent.parent.name)
+
+        with mock.patch.object(module.os.path, "ismount", return_value=True), mock.patch.object(
+            module,
+            "volume_metadata",
+            return_value={"name": "STORAGE 1", "id": "volume-1", "filesystem": "exfat"},
+        ):
+            with self.assertRaises(module.ExternalStorageUnavailable):
+                module.worktree_root(self.root, config)
+
+    def test_reconcile_preserves_tasks_while_storage_is_offline(self) -> None:
+        self.config()
+        self.cli("init")
+        self.cli("create-worker", "T1", "--title", "one", "--owns", "src/**")
+        specification = importlib.util.spec_from_file_location(
+            "tangle_orchestrator_reconcile_test", ORCHESTRATOR
+        )
+        assert specification and specification.loader
+        module = importlib.util.module_from_spec(specification)
+        specification.loader.exec_module(module)
+        unavailable = {
+            "available": False,
+            "mode": "external",
+            "mount": "/Volumes/OFFLINE",
+            "reason": "external storage is offline",
+            "minimum_free_gb": 5,
+        }
+        previous = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with mock.patch.object(module, "storage_health", return_value=unavailable):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    module.cmd_reconcile(object())
+                with self.assertRaises(module.ExternalStorageUnavailable):
+                    module.cmd_poll(mock.Mock(task_id=None))
+        finally:
+            os.chdir(previous)
+        self.assertEqual("ready", self.state()["tasks"]["T1"]["status"])
 
 
 class ReviewAndIntegrationTests(RepoCase):
@@ -327,6 +428,32 @@ class ReviewAndIntegrationTests(RepoCase):
         self.cli("cleanup", "T1", "--delete-branch")
         self.assertIsNone(self.state()["tasks"]["T1"]["worktree"])
 
+    def test_worker_reports_are_bounded_and_cleaned_artifacts_can_be_pruned(self) -> None:
+        self.config(resources__max_worker_report_kb=1)
+        self.cli("init")
+        self.cli("create-worker", "T1", "--title", "owned", "--owns", "owned/**")
+        self.commit_worker("T1", "owned/result.txt")
+        self.cli("complete", "T1", "--tests", "x" * 5000)
+        report = self.state()["tasks"]["T1"]["tests"]
+        self.assertLessEqual(len(report.encode("utf-8")), 1024)
+        self.assertIn("report truncated", report)
+        self.cli("accept", "T1")
+        self.cli("integrate", "T1")
+        self.cli("cleanup", "T1", "--delete-branch")
+        artifact = self.root / ".tangle" / "logs" / "T1-attempt-1.stderr.log"
+        artifact.write_text("old diagnostic", encoding="utf-8")
+
+        preview = json.loads(
+            self.cli("prune-runtime", "--older-than-days", "0", "--dry-run").stdout
+        )
+        self.assertEqual(1, preview["files"])
+        self.assertTrue(artifact.is_file())
+        removed = json.loads(
+            self.cli("prune-runtime", "--older-than-days", "0").stdout
+        )
+        self.assertEqual(1, removed["files"])
+        self.assertFalse(artifact.exists())
+
     def test_dependencies_are_composed_and_integrated_in_order(self) -> None:
         self.config()
         self.cli("init")
@@ -387,13 +514,17 @@ path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text('from fake codex\\n', encoding='utf-8')
 subprocess.run(['git', 'add', 'owned/worker.txt'], check=True)
 subprocess.run(['git', 'commit', '-m', 'fake worker'], check=True, stdout=subprocess.DEVNULL)
-output.write_text('tests: fake suite passed', encoding='utf-8')
+output.write_text('tests: fake suite passed\\n' + ('x' * 5000), encoding='utf-8')
 print(json.dumps({'type': 'thread.started', 'thread_id': 'fake-thread'}))
 """,
             encoding="utf-8",
         )
         fake.chmod(0o755)
-        self.config(workers__command=str(fake), workers__timeout_seconds=30)
+        self.config(
+            workers__command=str(fake),
+            workers__timeout_seconds=30,
+            resources__max_worker_report_kb=1,
+        )
         self.cli("init")
         self.cli("create-worker", "T1", "--title", "fake", "--owns", "owned/**")
         self.cli("launch", "T1")
@@ -407,9 +538,22 @@ print(json.dumps({'type': 'thread.started', 'thread_id': 'fake-thread'}))
         self.assertEqual("review", task["status"], task.get("last_error"))
         self.assertEqual("fake-thread", task["session_id"])
         self.assertEqual(["owned/worker.txt"], task["changed_files"])
+        self.assertLessEqual(len(task["tests"].encode("utf-8")), 1024)
+        self.assertIn("report truncated", task["tests"])
 
 
 class UtilityTests(unittest.TestCase):
+    def test_adaptive_worker_limit_is_conservative_on_small_computers(self) -> None:
+        specification = importlib.util.spec_from_file_location(
+            "tangle_orchestrator_resources_test", ORCHESTRATOR
+        )
+        assert specification and specification.loader
+        module = importlib.util.module_from_spec(specification)
+        specification.loader.exec_module(module)
+        self.assertEqual(1, module.memory_worker_limit(8 * 1024**3))
+        self.assertEqual(2, module.memory_worker_limit(16 * 1024**3))
+        self.assertEqual(4, module.memory_worker_limit(64 * 1024**3))
+
     def test_codex_target_state_is_locked_per_target(self) -> None:
         with tempfile.TemporaryDirectory(prefix="tangle-lock-") as temporary:
             state = Path(temporary) / "state"
@@ -643,6 +787,7 @@ class ProductLayerTests(RepoCase):
             by_name = {tool["name"]: tool for tool in tools}
             self.assertIn("tangle_open_dashboard", names)
             self.assertIn("tangle_accept_worker", names)
+            self.assertIn("tangle_prune_runtime", names)
             self.assertNotIn("shell", " ".join(names))
             self.assertTrue(by_name["tangle_status"]["annotations"]["readOnlyHint"])
             self.assertTrue(by_name["tangle_launch_worker"]["annotations"]["openWorldHint"])
@@ -662,6 +807,17 @@ class ProductLayerTests(RepoCase):
                 {"name": "tangle_status", "arguments": {}},
             )["result"]
             self.assertEqual("main", status["structuredContent"]["result"]["branch"])
+            pruned = self.mcp_call(
+                process,
+                40,
+                "tools/call",
+                {
+                    "name": "tangle_prune_runtime",
+                    "arguments": {"older_than_days": 0, "dry_run": True},
+                },
+            )["result"]
+            self.assertFalse(pruned["isError"], pruned)
+            self.assertEqual(0, pruned["structuredContent"]["result"]["files"])
             unknown = self.mcp_call(
                 process,
                 5,
@@ -762,6 +918,8 @@ class ProductLayerTests(RepoCase):
                 markup = response.read().decode("utf-8")
                 self.assertEqual("DENY", response.headers["X-Frame-Options"])
                 self.assertIn("no-store", response.headers["Cache-Control"])
+            self.assertIn("document.hidden", markup)
+            self.assertIn("10000", markup)
             match = re.search(r'<meta name="tangle-token" content="([^"]+)">', markup)
             self.assertIsNotNone(match)
             token = match.group(1) if match else ""
@@ -856,6 +1014,7 @@ class ProductLayerTests(RepoCase):
                 )
                 manifest = json.loads(bundle.read("manifest.json"))
                 self.assertEqual("0.3", manifest["manifest_version"])
+                self.assertEqual("0.4.0", manifest["version"])
                 self.assertEqual("tangle", manifest["name"])
                 self.assertEqual("server/tangle_mcp_server.py", manifest["server"]["entry_point"])
 
